@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VMISS 抢购助手
 // @namespace    vmiss-pro
-// @version      3.1.5
+// @version      3.1.6
 // @description  VMISS 库存监控与自动抢购：商品浏览、配置项、优惠码、推送，全部在插件内
 // @author       VMISS PRO
 // @license      MIT
@@ -24,7 +24,7 @@
 (function () {
   'use strict';
 
-  const LATEST = '3.1.5';
+  const LATEST = '3.1.6';
   const VERSION_URL = '';
 
   const K = (n) => 'vmiss_v3_' + n;
@@ -962,12 +962,24 @@
 
     let h = '<div class="filters">';
     if (cats.length) {
-      h += '<select id="vp-catf">' + cats.map((c) => '<option value="' + esc(c.slug) + '"' + (cur === c.slug ? ' selected' : '') + '>' + esc(c.name) + '</option>').join('') + '</select>';
+      h += '<select id="vp-catf">' + cats.map((c) => '<option value="' + esc(c.slug) + '"' + (cur === c.slug ? ' selected' : '') + '>' +
+        esc(c.name) + (c.live === false ? '　🚫已隐藏' : '') + '</option>').join('') + '</select>';
     } else {
       h += '<input id="vp-catslug" placeholder="分类 slug">';
     }
     h += '<button class="b g" id="vp-load">' + (UI.loading ? '加载中' : '加载') + '</button>' +
       '<button class="b" id="vp-recats" title="重新读取官网分类导航，用于官网新增/改名分类后同步">刷新分类</button></div>';
+    {
+      const cc = cats.filter((c) => c.slug === cur)[0];
+      const hiddenCount = cats.filter((c) => c.live === false).length;
+      if (cc && cc.live === false) {
+        h += '<div style="margin:7px 0;padding:7px 10px;border-radius:5px;background:rgba(251,191,36,.1);border:1px solid rgba(251,191,36,.25);color:#fbbf24;font-size:11.5px;line-height:1.6">' +
+          '⚠ 这个分类官网现在看不到了（可能被隐藏或删除）。插件按「只加不删」保留它，你的监控和商品缓存都还在。<br>' +
+          '点「加载」试一下：<b>能拉到商品</b> = 只是隐藏；<b>报 HTTP 404</b> = 已删除。</div>';
+      } else if (hiddenCount) {
+        h += '<div class="hint" style="margin:5px 0">清单里有 ' + hiddenCount + ' 个分类官网已看不到（下拉框里带 🚫 标记），保留是为了不丢数据。</div>';
+      }
+    }
 
     if (items.length) {
       h += '<div class="toolbar"><input id="vp-q" placeholder="在本分类里搜索" value="' + esc(UI.q) + '">' +
@@ -1147,20 +1159,41 @@
           fresh = got;
         }
         if (fresh && fresh.length) {
-          const alive = {};
-          for (const c of fresh) alive[c.slug] = 1;
-          const before = (DB.catalog.products || []).length;
+          const oldCats = DB.catalog.cats || [];
 
-          const kept = (DB.catalog.products || []).filter((p) => alive[p.categorySlug]);
-          const gone = (DB.catalog.cats || []).filter((c) => !alive[c.slug]).map((c) => c.name);
-          const addedCats = fresh.filter((c) => !(DB.catalog.cats || []).some((o) => o.slug === c.slug)).map((c) => c.name);
-          DB.catalog = { at: DB.catalog.at, catsAt: Date.now(), cats: fresh, products: kept };
+          const prevLive = oldCats.filter((c) => c.live !== false).length;
+          if (prevLive >= 4 && fresh.length < prevLive * 0.5) {
+            log('error', '  ⚠ 本次只解析到 ' + fresh.length + ' 个分类（上次 ' + prevLive + ' 个），疑似响应异常');
+            log('error', '    已放弃本次合并，清单一律不动。稍后可在「刷新分类」重试');
+            return;
+          }
+          const liveSlugs = {};
+          for (const c of fresh) liveSlugs[c.slug] = 1;
+          const wasMarkedGone = {};
+          for (const c of oldCats) if (c.live === false) wasMarkedGone[c.slug] = 1;
+
+          const merged = [];
+          const seen = {};
+          for (const c of fresh) { merged.push({ slug: c.slug, name: c.name, live: true }); seen[c.slug] = 1; }
+          const goneCats = [];
+          for (const c of oldCats) {
+            if (seen[c.slug] || liveSlugs[c.slug]) continue;
+            seen[c.slug] = 1;
+            goneCats.push(c);
+            merged.push({ slug: c.slug, name: c.name, live: false, goneAt: c.goneAt || Date.now() });
+          }
+
+          const addedCats = fresh.filter((c) => !oldCats.some((o) => o.slug === c.slug)).map((c) => c.name);
+          const revived = fresh.filter((c) => wasMarkedGone[c.slug]).map((c) => c.name);
+
+          DB.catalog = { at: DB.catalog.at, catsAt: Date.now(), cats: merged, products: DB.catalog.products };
           save('catalog', DB.catalog);
-          if (UI.catFilter && !alive[UI.catFilter]) UI.catFilter = '';
-          log('info', '  拿到 ' + fresh.length + ' 个分类');
-          if (addedCats.length) log('warn', '  🆕 官网新增分类：' + addedCats.join('、'));
-          if (gone.length) log('warn', '  🚫 官网已隐藏/下架：' + gone.join('、'));
-          if (before !== kept.length) log('info', '  清掉 ' + (before - kept.length) + ' 个已下架分类的商品缓存');
+
+          log('info', '  官网在售 ' + fresh.length + ' 个 · 清单共 ' + merged.length + ' 个（只加不删）');
+          if (addedCats.length) log('warn', '  🆕 官网新增：' + addedCats.join('、'));
+          if (goneCats.length) log('warn', '  🚫 官网现在看不到（已保留并标记）：' + goneCats.map((c) => c.name).join('、'));
+          if (revived.length) log('warn', '  ✅ 官网恢复显示：' + revived.join('、'));
+          if (!addedCats.length && !goneCats.length && !revived.length) log('info', '  分类无变化');
         }
       }
       const cats = DB.catalog.cats || [];
@@ -1198,8 +1231,12 @@
 
   async function runFetchAll() {
     log('warn', '[批量] 拉取全部分类');
-    const cats = DB.catalog.cats || [];
-    if (!cats.length) { log('error', '还没有分类列表'); return; }
+    const allCats = DB.catalog.cats || [];
+    if (!allCats.length) { log('error', '还没有分类列表'); return; }
+
+    const cats = allCats.slice().sort((a, b) => (a.live === false ? 1 : 0) - (b.live === false ? 1 : 0));
+    const hiddenN = allCats.filter((c) => c.live === false).length;
+    if (hiddenN) log('info', '[批量] 含 ' + hiddenN + ' 个官网已隐藏的分类，排在最后拉');
 
     let gap = Math.max(GAP_MIN, Number(DB.settings.fetchAllGapMs) || GAP_MIN);
     const learned = Number(DB.settings.fetchAllGapMs) || GAP_MIN;
