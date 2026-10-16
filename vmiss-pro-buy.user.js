@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         VMISS 抢购助手
 // @namespace    vmiss-pro
-// @version      3.1.6
+// @version      3.1.8
 // @description  VMISS 库存监控与自动抢购：商品浏览、配置项、优惠码、推送，全部在插件内
 // @author       VMISS PRO
 // @license      MIT
 // @homepageURL  https://greasyfork.org/zh-CN/scripts/599690-vmiss-%E6%8A%A2%E8%B4%AD%E5%8A%A9%E6%89%8B
 // @supportURL   https://greasyfork.org/zh-CN/scripts/599690-vmiss-%E6%8A%A2%E8%B4%AD%E5%8A%A9%E6%89%8B/feedback
 // @source       https://github.com/threce/vmiss-buy-helper
+// @updateURL    https://raw.githubusercontent.com/threce/vmiss-buy-helper/main/vmiss-pro-buy.user.js
+// @downloadURL  https://raw.githubusercontent.com/threce/vmiss-buy-helper/main/vmiss-pro-buy.user.js
 // @match        https://app.vmiss.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -24,7 +26,7 @@
 (function () {
   'use strict';
 
-  const LATEST = '3.1.6';
+  const LATEST = '3.1.8';
   const VERSION_URL = '';
 
   const K = (n) => 'vmiss_v3_' + n;
