@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VMISS 抢购助手
 // @namespace    vmiss-pro
-// @version      3.2.0
+// @version      3.2.1
 // @description  VMISS 库存监控与自动抢购：商品浏览、配置项、优惠码、推送，全部在插件内
 // @author       VMISS PRO
 // @license      MIT
@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const LATEST = '3.2.0';
+  const LATEST = '3.2.1';
   const VERSION_URL = '';
 
   const K = (n) => 'vmiss_v3_' + n;
@@ -1317,6 +1317,8 @@
     UI.renderBrowse();
   }
 
+  const DEFAULT_QUEUE_PID = 32;
+
   const queueRunning = {};
   const persistQueues = () => save('queues', DB.queues);
 
@@ -1499,7 +1501,7 @@
       '这里填商品 <b>pid</b>，插件会盯着排队状态，一拿到入场资格就立刻加购下单。<br>' +
       '<span style="color:#fbbf24">注意</span>：排队页需要账号已登录，且部分商品要求历史消费额（ineligible 就是这条）。</div>';
     if (!list.length) {
-      h += '<div class="empty">还没有排队任务<br><span style="color:#5a5a64">点「+ 添加排队任务」，填商品 pid（链接里 pid= 后面那个数字）</span></div>';
+      h += '<div class="empty">还没有排队任务<br><span style="color:#5a5a64">点「+ 添加排队任务」，pid 已默认填好 <b style="color:#2dd4bf">' + DEFAULT_QUEUE_PID + '</b>（US.LA.TRI.Basic），一般不用改</span></div>';
       bd.innerHTML = h; bind(bd); return;
     }
     for (const q of list) {
@@ -1530,7 +1532,7 @@
 
   function openQueueEditor(existing) {
     const base = existing || {
-      id: nextId(), pid: 0, label: '',
+      id: nextId(), pid: DEFAULT_QUEUE_PID, label: '',
       intervalMs: 30000, pollMs: 3000, watchMs: 180000,
       paymentMethod: 'motionpayalipay', useBalance: false,
       couponCode: DB.settings.defaultCoupon || '', useCoupon: true,
