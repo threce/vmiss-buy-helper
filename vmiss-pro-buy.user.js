@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VMISS 抢购助手
 // @namespace    vmiss-pro
-// @version      3.2.3
+// @version      3.3.0
 // @description  VMISS 库存监控与自动抢购：商品浏览、配置项、优惠码、推送，全部在插件内
 // @author       VMISS PRO
 // @license      MIT
@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const LATEST = '3.2.3';
+  const LATEST = '3.3.0';
   const VERSION_URL = '';
 
   const K = (n) => 'vmiss_v3_' + n;
@@ -36,6 +36,7 @@
   const DB = {
     monitors: load('monitors', []),
     queues: load('queues', []),
+    saved: load('saved', []),
     settings: load('settings', {
       defaultIntervalMs: 30000,
       minGapMs: 1700,
@@ -820,7 +821,7 @@
     '#vp .hd .ttl{flex:1;font-weight:600;font-size:13px}',
     '#vp .hd .cnt{font-size:11px;color:#9a9aa5;font-variant-numeric:tabular-nums}',
     '#vp .hd button{background:none;border:0;color:#9a9aa5;cursor:pointer;font-size:15px;padding:2px 7px;line-height:1}',
-    '#vp .tabs{display:flex;background:#0d0d10;padding:0 8px;border-top:1px solid #1c1c22}',
+    '#vp .tabs{display:flex;background:#0d0d10;padding:0 8px;border-top:1px solid #1c1c22;overflow-x:auto;scrollbar-width:none}',
     '#vp .tabs button{flex:1;background:none;border:0;border-bottom:2px solid transparent;color:#8a8a95;padding:9px 4px;font-size:12px;cursor:pointer;font-family:inherit}',
     '#vp .tabs button.on{color:#2dd4bf;border-bottom-color:#2dd4bf}',
     '#vp .bd{flex:1;overflow-y:auto;padding:12px 13px;min-height:200px}',
@@ -896,6 +897,7 @@
       '<div class="tabs" id="vp-tabs">' +
       '<button data-tab="monitors" class="on">监控</button>' +
       '<button data-tab="queue">排队抢购</button>' +
+      '<button data-tab="saved">商品库</button>' +
       '<button data-tab="browse">选商品</button>' +
       '<button data-tab="logs">日志</button>' +
       '<button data-tab="settings">设置</button></div>' +
@@ -946,6 +948,7 @@
     if (!root) return;
     if (UI.tab === 'monitors') UI.renderMonitors();
     else if (UI.tab === 'queue') UI.renderQueue();
+    else if (UI.tab === 'saved') UI.renderSaved();
     else if (UI.tab === 'browse') UI.renderBrowse();
     else if (UI.tab === 'logs') UI.renderLogs();
     else UI.renderSettings();
@@ -996,6 +999,7 @@
           '<button class="b sm' + (m.enabled ? '' : ' g') + '" data-a="toggle" data-id="' + m.id + '">' + (m.enabled ? '暂停' : '启用') + '</button>' +
           '<button class="b sm" data-a="once" data-id="' + m.id + '">立即检查</button>' +
           '<button class="b sm" data-a="edit" data-id="' + m.id + '">配置</button>' +
+        '<button class="b sm" data-a="save" data-id="' + m.id + '" title="把商品身份和配置存起来，下架了也能重建">存入库</button>' +
           '<button class="b sm d" data-a="del" data-id="' + m.id + '">删除</button></div></div>';
       }
     }
@@ -1059,7 +1063,8 @@
         '<span class="meta">pid ' + p.pid + (p.specs ? ' · ' + esc(p.specs) : '') + '</span></span>' +
         '<span class="right"><span class="pr">' + yuan(p.price) + '</span>' +
         '<span class="stk' + (p.inStock ? ' hot' : '') + '">' + (p.inStock ? (p.stock && p.stock !== '-' ? esc(p.stock) : '有货') : '缺货') + '</span></span>' +
-        '<span class="add"><button class="b sm ' + (mon ? '' : 'g') + '" data-add="' + p.pid + '"' + (mon ? ' disabled' : '') + '>' + (mon ? '已监控' : '+ 监控') + '</button></span></div>';
+        '<span class="add"><button class="b sm" data-sv="' + p.pid + '" title="存进商品库，下架后也能找回">收藏</button>' +
+        '<button class="b sm ' + (mon ? '' : 'g') + '" data-add="' + p.pid + '"' + (mon ? ' disabled' : '') + '>' + (mon ? '已监控' : '+ 监控') + '</button></span></div>';
     }
     h += '<div class="hint" style="margin-top:14px;padding-top:12px;border-top:1px solid #24242b">要看全部分类？' +
       '<button class="b sm" id="vp-all">全部拉取</button> ' + cats.length + ' 个分类，按当前间隔约 ' +
@@ -1118,6 +1123,54 @@
       const id = Number(t.dataset.id || 0);
       const m = DB.monitors.filter((x) => x.id === id)[0];
 
+      if (t.id === 'sv-add') return openSavedEditor();
+      if (t.id === 'sv-clear') {
+        if (!DB.saved.length) return;
+        DB.saved = []; persistSaved(); log('info', '商品库已清空'); UI.renderSaved(); return;
+      }
+      if (t.dataset.sva) {
+        const sv = (DB.saved || []).filter((x) => Number(x.pid) === Number(t.dataset.sid))[0];
+        if (!sv) return;
+        if (t.dataset.sva === 'mon') {
+          if (DB.monitors.some((m) => Number(m.pid) === Number(sv.pid))) { log('warn', '已有监控，无需再建'); return; }
+          DB.monitors.push(monitorFromSaved(sv));
+          persist();
+          log('info', '从商品库重建监控：' + sv.name + '（pid ' + sv.pid + '）');
+          UI.tab = 'monitors'; UI.syncTabs(); UI.render(); UI.renderStatus();
+          return;
+        }
+        if (t.dataset.sva === 'queue') {
+          if ((DB.queues || []).some((q) => Number(q.pid) === Number(sv.pid))) { log('warn', '已在排队列表'); return; }
+          DB.queues.push({
+            id: nextId(), pid: sv.pid, url: '', label: sv.name || ('pid ' + sv.pid),
+            intervalMs: 30000, pollMs: 3000, watchMs: 180000,
+            paymentMethod: sv.paymentMethod || 'motionpayalipay', useBalance: false,
+            couponCode: sv.couponCode || '', useCoupon: true,
+            hostname: sv.hostname || '', rootPassword: sv.rootPassword || '',
+            ns1Prefix: '', ns2Prefix: '', options: {},
+            stopAfter: true, enabled: true, checks: 0, buys: 0,
+            stateText: '', state: '', lastCheck: 0, nextAt: 0,
+          });
+          persistQueues();
+          log('info', '从商品库加入排队：' + sv.name + '（pid ' + sv.pid + '）');
+          UI.tab = 'queue'; UI.syncTabs(); UI.render();
+          return;
+        }
+        if (t.dataset.sva === 'check') {
+          const mm = DB.monitors.filter((x) => Number(x.pid) === Number(sv.pid))[0];
+          if (mm) { UI.tab = 'monitors'; UI.syncTabs(); UI.render(); log('info', '---- 手动触发 ----'); void runOne(mm); return; }
+          log('info', '商品库里还没有在跑的监控 —— 先点「建监控」');
+          return;
+        }
+        if (t.dataset.sva === 'del') {
+          DB.saved = DB.saved.filter((x) => Number(x.pid) !== Number(sv.pid));
+          persistSaved();
+          log('info', '已从商品库删除：' + sv.name);
+          UI.renderSaved();
+          return;
+        }
+        return;
+      }
       if (t.id === 'q-add') return openQueueEditor(null);
       if (t.id === 'q-allon') { DB.queues.forEach((x) => { x.enabled = true; x.nextAt = 0; }); persistQueues(); UI.renderQueue(); return; }
       if (t.id === 'q-alloff') { DB.queues.forEach((x) => { x.enabled = false; }); persistQueues(); UI.renderQueue(); return; }
@@ -1164,7 +1217,14 @@
       if (t.dataset.a === 'once' && m) { log('info', '---- 手动触发 ----'); void runOne(m); return; }
       if (t.dataset.a === 'del' && m) { DB.monitors = DB.monitors.filter((x) => x.id !== m.id); persist(); UI.renderMonitors(); UI.renderStatus(); return; }
       if (t.dataset.a === 'edit' && m) return openEditor(m, null);
+      if (t.dataset.a === 'save' && m) { saveProduct(m); if (UI.ready && UI.tab === 'saved') UI.renderSaved(); return; }
 
+      if (t.dataset.sv) {
+        const p2 = (DB.catalog.products || []).filter((x) => Number(x.pid) === Number(t.dataset.sv))[0];
+        if (p2) saveProduct(p2);
+        else log('error', '找不到这个商品，稍后重试');
+        return;
+      }
       if (t.dataset.add) {
         const p = DB.catalog.products.filter((x) => x.pid === Number(t.dataset.add))[0];
         if (!p) return;
@@ -1763,6 +1823,134 @@
       dlg.remove();
       log('info', '排队任务已保存 · pid ' + pid);
       UI.renderQueue();
+    };
+  }
+
+  const persistSaved = () => save('saved', DB.saved);
+
+  function saveProduct(p, quiet) {
+    const list = DB.saved || [];
+    const nm = p.name || ('pid ' + p.pid);
+    const dup = list.filter((s) =>
+      (p.pid && Number(s.pid) === Number(p.pid)) ||
+      (p.categorySlug && p.slug && s.categorySlug === p.categorySlug && s.slug === p.slug))[0];
+    if (dup) {
+      const msg = '商品库里已存在，无需再保存：' + (dup.name || dup.slug) + '（pid ' + dup.pid + '）';
+      log('warn', '  ' + msg);
+      if (!quiet) push('VMISS 商品库', (dup.name || dup.slug) + '\n已存在，无需再保存');
+      return false;
+    }
+    list.push({
+      pid: Number(p.pid) || 0,
+      name: nm,
+      categorySlug: p.categorySlug || '',
+      slug: p.slug || '',
+      price: Number(p.price) || 0,
+      specs: p.specs || '',
+      options: p.options ? Object.assign({}, p.options) : {},
+      hostname: p.hostname || '',
+      rootPassword: p.rootPassword || '',
+      ns1Prefix: p.ns1Prefix || '',
+      ns2Prefix: p.ns2Prefix || '',
+      billingCycle: p.billingCycle || 'monthly',
+      paymentMethod: p.paymentMethod || 'motionpayalipay',
+      couponCode: p.couponCode || '',
+      useCoupon: p.useCoupon !== false,
+      useBalance: !!p.useBalance,
+      maxPrice: Number(p.maxPrice) || 0,
+      intervalMs: Number(p.intervalMs) || DB.settings.defaultIntervalMs,
+      stopAfter: p.stopAfter !== false,
+      savedAt: Date.now(),
+    });
+    DB.saved = list;
+    persistSaved();
+    log('info', '  ✅ 已存入商品库：' + nm + '（pid ' + p.pid + (p.categorySlug ? ' · ' + p.categorySlug + '/' + p.slug : '') + '）· 共 ' + list.length + ' 个');
+    if (UI.ready && UI.tab === 'saved') UI.renderSaved();
+    return true;
+  }
+
+  function monitorFromSaved(s) {
+    return {
+      id: nextId(), pid: s.pid, name: s.name, slug: s.slug, categorySlug: s.categorySlug,
+      price: s.price || 0,
+      intervalMs: s.intervalMs || DB.settings.defaultIntervalMs,
+      paymentMethod: s.paymentMethod || 'motionpayalipay',
+      useBalance: !!s.useBalance,
+      couponCode: s.couponCode || DB.settings.defaultCoupon || '',
+      useCoupon: s.useCoupon !== false,
+      maxPrice: s.maxPrice || 0,
+      billingCycle: s.billingCycle || 'monthly',
+      os: '',
+      hostname: s.hostname || '', rootPassword: s.rootPassword || '',
+      ns1Prefix: s.ns1Prefix || '', ns2Prefix: s.ns2Prefix || '',
+      options: s.options ? Object.assign({}, s.options) : {},
+      stopAfter: s.stopAfter !== false,
+      enabled: true, checks: 0, buys: 0, fails: 0,
+      stateText: '', lastState: '', lastCheck: 0, nextAt: 0,
+    };
+  }
+
+  UI.renderSaved = function () {
+    if (!root || UI.tab !== 'saved') return;
+    const bd = root.querySelector('#vp-bd');
+    const list = (DB.saved || []).slice().sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+    let h = '<div class="act"><button class="b g" id="sv-add">+ 手动添加</button>' +
+      (list.length ? '<button class="b d" id="sv-clear">清空全部</button>' : '') + '</div>';
+    h += '<div class="hint" style="margin-bottom:9px;line-height:1.7">' +
+      '这里存的是<b style="color:#2dd4bf">商品身份</b>（pid + 分类 slug + 商品 slug）连同配置，不依赖分类目录。<br>' +
+      '官网下架、分类隐藏、抢完下架 —— 只要商品回来，从这里一键重建监控就能继续抢。<br>' +
+      '<span style="color:#fbbf24">建议</span>：现在就把还在监控的 TRI 商品点「存入库」，免得下架后找不回来。</div>';
+    if (!list.length) {
+      h += '<div class="empty">商品库是空的<br><span style="color:#5a5a64">去「监控」点「存入库」，或在「选商品」点「收藏」</span></div>';
+      bd.innerHTML = h; bind(bd); return;
+    }
+    for (const s of list) {
+      const hasMon = DB.monitors.some((m) => Number(m.pid) === Number(s.pid));
+      const hasQ = (DB.queues || []).some((q) => Number(q.pid) === Number(s.pid));
+      h += '<div class="m"><div class="r1"><span class="nm" title="' + esc(s.name) + '">' + esc(s.name) + '</span>' +
+        '<span class="pr">' + yuan(s.price || 0) + '</span></div>' +
+        '<div class="r2"><span>pid ' + s.pid + '</span>' +
+        (s.categorySlug ? '<span>' + esc(s.categorySlug) + '/' + esc(s.slug) + '</span>' : '<span style="color:#fbbf24">无 slug</span>') +
+        '<span>' + ago(s.savedAt) + '存入</span>' +
+        (Object.keys(s.options || {}).length ? '<span style="color:#2dd4bf">配置 ' + Object.keys(s.options).length + ' 项</span>' : '') +
+        (hasMon ? '<span style="color:#34d399">已在监控</span>' : '') +
+        (hasQ ? '<span style="color:#2dd4bf">已排队</span>' : '') +
+        '</div>' +
+        '<div class="r3">' +
+        '<button class="b sm' + (hasMon ? '' : ' g') + '" data-sva="mon" data-sid="' + s.pid + '"' + (hasMon ? ' disabled' : '') + '>' + (hasMon ? '已监控' : '建监控') + '</button>' +
+        '<button class="b sm" data-sva="queue" data-sid="' + s.pid + '"' + (hasQ ? ' disabled' : '') + '>' + (hasQ ? '已排队' : '加到排队') + '</button>' +
+        '<button class="b sm" data-sva="check" data-sid="' + s.pid + '">试一下</button>' +
+        '<button class="b sm d" data-sva="del" data-sid="' + s.pid + '">删除</button></div></div>';
+    }
+    bd.innerHTML = h;
+    bind(bd);
+  };
+
+  function openSavedEditor() {
+    const dlg = document.createElement('div');
+    dlg.className = 'dlg';
+    dlg.innerHTML = '<div class="c"><h4>手动存入商品库</h4>' +
+      '<label class="f"><span>商品 pid</span><input id="sv_pid" type="number" placeholder="例如 32"></label>' +
+      '<label class="f"><span>分类 slug</span><input id="sv_cat" placeholder="例如 us-los-angeles-tri"></label>' +
+      '<label class="f"><span>商品 slug</span><input id="sv_slug" placeholder="例如 basic"></label>' +
+      '<label class="f"><span>名称</span><input id="sv_name" placeholder="例如 US.LA.TRI.Basic"></label>' +
+      '<label class="f"><span>参考价格</span><input id="sv_price" type="number" step="0.01" value="0"></label>' +
+      '<div class="hint" style="margin-bottom:8px">pid 和「分类 slug + 商品 slug」至少填一组。都填最好 —— 抢购走 slug，pid 只用于显示和去重。</div>' +
+      '<div class="row"><button id="sv_cancel">取消</button><button class="g" id="sv_ok">保存</button></div></div>';
+    root.appendChild(dlg);
+    const g = (n) => dlg.querySelector('#' + n);
+    g('sv_cancel').onclick = () => dlg.remove();
+    g('sv_ok').onclick = () => {
+      const item = {
+        pid: Number(g('sv_pid').value) || 0,
+        categorySlug: g('sv_cat').value.trim(),
+        slug: g('sv_slug').value.trim(),
+        name: g('sv_name').value.trim(),
+        price: Number(g('sv_price').value) || 0,
+      };
+      if (!item.pid && !(item.categorySlug && item.slug)) { log('error', 'pid 和「分类+商品 slug」至少填一组'); return; }
+      if (!item.name) item.name = item.pid ? ('pid ' + item.pid) : (item.categorySlug + '/' + item.slug);
+      if (saveProduct(item)) { dlg.remove(); UI.renderSaved(); }
     };
   }
 
