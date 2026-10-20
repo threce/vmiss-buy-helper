@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VMISS 抢购助手
 // @namespace    vmiss-pro
-// @version      3.1.8
+// @version      3.2.0
 // @description  VMISS 库存监控与自动抢购：商品浏览、配置项、优惠码、推送，全部在插件内
 // @author       VMISS PRO
 // @license      MIT
@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const LATEST = '3.1.8';
+  const LATEST = '3.2.0';
   const VERSION_URL = '';
 
   const K = (n) => 'vmiss_v3_' + n;
@@ -35,6 +35,7 @@
 
   const DB = {
     monitors: load('monitors', []),
+    queues: load('queues', []),
     settings: load('settings', {
       defaultIntervalMs: 30000,
       minGapMs: 1700,
@@ -99,7 +100,7 @@
   function push(title, body) {
     const s = DB.settings;
     if (s.notify && typeof Notification !== 'undefined') {
-      try { new Notification(title, { body }); } catch (e) {  }
+      try { new Notification(title, { body }); } catch (e) { /* 忽略 */ }
     }
     if (s.tgToken && s.tgChat) {
       const url = 'https://api.telegram.org/bot' + s.tgToken + '/sendMessage';
@@ -159,7 +160,7 @@
         onload: (r) => {
           const txt = String(r.responseText || '');
           let j = null;
-          try { j = JSON.parse(txt); } catch (e) {  }
+          try { j = JSON.parse(txt); } catch (e) { /* 非 JSON */ }
           const code = j ? j.errcode : null;
           const msg = j ? String(j.errmsg || '') : txt.slice(0, 160);
           if (code === 0) { log('info', '  [钉钉] 推送成功'); return; }
@@ -731,6 +732,15 @@
         m.nextAt = now + Math.round(m.intervalMs * (0.75 + Math.random() * 0.5));
         void runOne(m);
       }
+
+      const dueQ = (DB.queues || []).filter((q) => q.enabled && !queueRunning[q.id] && (!q.nextAt || q.nextAt <= now));
+      if (dueQ.length) {
+        dueQ.sort((a, b) => (a.nextAt || 0) - (b.nextAt || 0));
+        const q = dueQ[0];
+        q.nextAt = now + Math.round((q.intervalMs || 30000) * (0.75 + Math.random() * 0.5));
+        persistQueues();
+        void runQueue(q);
+      }
       schedule();
     }, 900);
   }
@@ -743,7 +753,7 @@
       if (!DB.monitors.some((m) => m.enabled)) return;
       if (csrfCache.v && Date.now() - csrfCache.at < 300000) return;
       if (Object.keys(running).length) return;
-      try { await csrf(true); } catch (e) {  }
+      try { await csrf(true); } catch (e) { /* 下次再试 */ }
     };
     prewarmTimer = setInterval(() => void tick(), 60000);
     setTimeout(() => void tick(), 5000);
@@ -850,6 +860,7 @@
       '<span class="cnt" id="vp-cnt"></span><button id="vp-min">-</button></div>' +
       '<div class="tabs" id="vp-tabs">' +
       '<button data-tab="monitors" class="on">监控</button>' +
+      '<button data-tab="queue">排队抢购</button>' +
       '<button data-tab="browse">选商品</button>' +
       '<button data-tab="logs">日志</button>' +
       '<button data-tab="settings">设置</button></div>' +
@@ -899,6 +910,7 @@
   UI.render = function () {
     if (!root) return;
     if (UI.tab === 'monitors') UI.renderMonitors();
+    else if (UI.tab === 'queue') UI.renderQueue();
     else if (UI.tab === 'browse') UI.renderBrowse();
     else if (UI.tab === 'logs') UI.renderLogs();
     else UI.renderSettings();
@@ -910,6 +922,7 @@
     const busy = Object.keys(running).length > 0;
     root.querySelector('#vp-dot').className = 'dot' + (busy ? ' busy' : on > 0 ? ' on' : '');
     root.querySelector('#vp-cnt').textContent = on + ' 监控 · 检查 ' + DB.monitors.reduce((s, m) => s + (m.checks || 0), 0) + ' · 成交 ' + DB.monitors.reduce((s, m) => s + (m.buys || 0), 0);
+    const qn = (DB.queues || []).length;
     const pushOn = (DB.settings.tgToken && DB.settings.tgChat) || DB.settings.dingWebhook;
     root.querySelector('#vp-ft').innerHTML = '<span>' + (on ? '● 运行中' : '○ 已暂停') + '</span>' +
       '<span>目录 ' + (DB.catalog.products.length || 0) + '</span>' +
@@ -1067,6 +1080,20 @@
       if (!t) return;
       const id = Number(t.dataset.id || 0);
       const m = DB.monitors.filter((x) => x.id === id)[0];
+
+      if (t.id === 'q-add') return openQueueEditor(null);
+      if (t.id === 'q-allon') { DB.queues.forEach((x) => { x.enabled = true; x.nextAt = 0; }); persistQueues(); UI.renderQueue(); return; }
+      if (t.id === 'q-alloff') { DB.queues.forEach((x) => { x.enabled = false; }); persistQueues(); UI.renderQueue(); return; }
+      if (t.dataset.qa) {
+        const qq = (DB.queues || []).filter((x) => x.id === Number(t.dataset.qid))[0];
+        if (!qq) return;
+        if (t.dataset.qa === 'toggle') { qq.enabled = !qq.enabled; qq.nextAt = 0; persistQueues(); UI.renderQueue(); return; }
+        if (t.dataset.qa === 'once') { log('info', '---- 手动排队检查 ----'); void runQueue(qq); return; }
+        if (t.dataset.qa === 'edit') return openQueueEditor(qq);
+        if (t.dataset.qa === 'del') { DB.queues = DB.queues.filter((x) => x.id !== qq.id); persistQueues(); UI.renderQueue(); return; }
+        if (t.dataset.qa === 'copy') { navigator.clipboard.writeText(qq.genPw || '').catch(() => undefined); return; }
+        return;
+      }
 
       if (t.id === 'vp-add') return openEditor(null, null);
       if (t.id === 'vp-gobrowse') { UI.tab = 'browse'; UI.syncTabs(); UI.render(); return; }
@@ -1288,6 +1315,288 @@
     log('info', '[批量] 完成 ' + DB.catalog.products.length + ' 个商品（成功 ' + okCount + ' 分类，跳过 ' + skipCount + '）');
     if (skipped.length) log('warn', '[批量] 这次没拉到：' + skipped.join('、') + ' —— 过几分钟再点「全部拉取」补上');
     UI.renderBrowse();
+  }
+
+  const queueRunning = {};
+  const persistQueues = () => save('queues', DB.queues);
+
+  const qpath = (u) => {
+    let s = String(u || '').trim();
+    const scheme = s.indexOf('://');
+    if (scheme >= 0) {
+      const after = s.slice(scheme + 3);
+      const slash = after.indexOf('/');
+      s = slash >= 0 ? after.slice(slash) : '/';
+    }
+    while (s.charAt(0) === '/') s = s.slice(1);
+    return '/' + s;
+  };
+
+  async function queuePage(pid) {
+    const r = await req('/index.php?m=vmiss_queue&pid=' + pid);
+    if (isBad(r.status, r.text)) return { limited: true, status: r.status, verdict: r.verdict };
+    const doc = new DOMParser().parseFromString(r.text, 'text/html');
+    const vmq = doc.getElementById('vmq');
+    if (!vmq) return { gone: true, status: r.status };
+    const form = vmq.querySelector('form');
+    let fields = null;
+    if (form) {
+      fields = {};
+      for (const el of form.querySelectorAll('input[name],select[name],textarea[name]')) {
+        const ty = String(el.getAttribute('type') || '').toLowerCase();
+        if ((ty === 'checkbox' || ty === 'radio') && !el.checked) continue;
+        if (fields[el.name] === undefined) fields[el.name] = el.value;
+      }
+    }
+    const sub = vmq.querySelector('.vmq-sub');
+    return {
+      ok: true,
+      poll: vmq.getAttribute('data-poll') || ('index.php?m=vmiss_queue&pid=' + pid + '&vq_status=1'),
+      cart: vmq.getAttribute('data-cart') || ('cart.php?a=add&pid=' + pid),
+      lastState: vmq.getAttribute('data-last-state') || '',
+      form: form ? { action: form.getAttribute('action') || '', fields } : null,
+      note: sub ? sub.textContent.replace(/\s+/g, ' ').trim() : '',
+    };
+  }
+
+  async function queueStatus(poll) {
+    const r = await req(qpath(poll));
+    if (isBad(r.status, r.text)) return { limited: true, status: r.status };
+    try {
+      const d = JSON.parse(r.text);
+      return { ok: true, state: String(d.state || ''), ahead: d.ahead, remaining: d.remaining };
+    } catch (e) { return { bad: true, text: String(r.text).slice(0, 120) }; }
+  }
+
+  async function queueJoin(pg, pid, token) {
+    const act = pg.form.action && pg.form.action !== '#' ? pg.form.action : ('/index.php?m=vmiss_queue&pid=' + pid);
+    const body = Object.assign({}, pg.form.fields);
+    if (token && body.token === undefined) body.token = token;
+    const r = await post(qpath(act), body);
+    return { ok: !isBad(r.status, r.text), status: r.status };
+  }
+
+  async function runQueue(q) {
+    if (queueRunning[q.id] || !q.enabled) return;
+    queueRunning[q.id] = 1;
+    const t0 = Date.now();
+    trace = 'Q' + q.pid;
+    const upd = () => { if (UI.ready && UI.tab === 'queue') UI.renderQueue(); };
+    const setState = (s, txt) => { q.state = s; q.stateText = txt; upd(); };
+    try {
+      q.lastCheck = Date.now();
+      q.checks = (q.checks || 0) + 1;
+      log('info', '> 排队 pid ' + q.pid + (q.label ? '（' + q.label + '）' : ''));
+      upd();
+
+      const token = await csrf();
+      if (!token) { setState('error', '拿不到会话令牌'); return; }
+
+      let pg = await queuePage(q.pid);
+      for (let a = 1; a <= 2 && pg.limited; a += 1) {
+        log('warn', '  排队页限速 HTTP ' + pg.status + '，等 ' + (a * 8) + 's');
+        setState('skip', '排队页限速中');
+        await sleep(a * 8000); lastReqAt = 0;
+        pg = await queuePage(q.pid);
+      }
+      if (!pg.ok) { setState('error', pg.gone ? '排队页不存在（pid 错或已下架）' : ('拿不到排队页 HTTP ' + (pg.status || '?'))); return; }
+
+      q.pollUrl = pg.poll;
+      q.cartUrl = pg.cart;
+      if (pg.note && !q.label) q.label = pg.note;
+
+      const pollMs = Math.max(1000, Number(q.pollMs) || 3000);
+      const maxTurns = Math.max(3, Math.ceil((Number(q.watchMs) || 120000) / pollMs));
+      let st = null;
+      let joins = 0;
+
+      for (let k = 0; k < maxTurns; k += 1) {
+        st = await queueStatus(pg.poll);
+        if (!st.ok) {
+          if (st.limited) { setState('skip', '状态接口限速'); await sleep(6000); lastReqAt = 0; continue; }
+          setState('error', '状态接口异常: ' + (st.text || ''));
+          return;
+        }
+        q.state = st.state;
+        q.ahead = st.ahead;
+        q.remaining = st.remaining;
+
+        if (st.state === 'granted') { setState('granted', '入场资格到手 · 剩余 ' + (st.remaining || 0) + 's'); break; }
+        if (st.state === 'waiting') setState('waiting', '排队中 · 前面 ' + (st.ahead === null || st.ahead === undefined ? '?' : st.ahead) + ' 位');
+        else if (st.state === 'closed') { setState('closed', '队列未开放'); return; }
+        else if (st.state === 'ineligible') { setState('error', '账号不满足购买资格（看历史消费额）'); return; }
+        else if (st.state === 'invalid_link') { setState('error', '排队链接已失效，需找 VMISS 要新链接'); return; }
+        else if (st.state === 'processing') { setState('processing', '结账处理中'); return; }
+        else if (st.state === 'not_joined') {
+          if (pg.form && joins < 3) {
+            const j = await queueJoin(pg, q.pid, token);
+            joins += 1;
+            log('info', '  提交加入队列表单 → ' + (j.ok ? '已提交' : 'HTTP ' + j.status));
+            setState('not_joined', '正在加入队列（第 ' + joins + ' 次）');
+            await sleep(1500); lastReqAt = 0;
+            continue;
+          }
+          setState('not_joined', pg.form ? '加入表单提交失败' : '页面没有加入表单（队列可能刚落开）');
+        } else setState('error', '未知状态: ' + st.state);
+
+        await sleep(pollMs);
+      }
+
+      if (!st || st.state !== 'granted') {
+        if (st && st.state === 'waiting') setState('waiting', '本轮没轮到，下次继续');
+        return;
+      }
+
+      burst = true;
+      log('stock', '  ⚡ 入场资格到手，剩余 ' + (st.remaining || 0) + 's，立刻下单');
+      if (DB.settings.pushOnRestock) push('VMISS 排队轮到你了', (q.label || ('pid ' + q.pid)) + ' · 剩余 ' + (st.remaining || 0) + 's');
+
+      const addR = await req(qpath(pg.cart));
+      const i = (addR.text.match(/name="i"[^>]*value="(\d+)"/) || [])[1];
+      if (!i) {
+        const oos = /out of stock|缺货|sold out/i.test(addR.text);
+        setState('out', oos ? '加购失败：缺货' : ('加购失败 HTTP ' + addR.status));
+        log('error', '  加购失败 HTTP ' + addR.status + (oos ? ' · 缺货' : ''));
+        return;
+      }
+      log('info', '  已加购 i=' + i);
+      upd();
+
+      const cfg = await configure(q, token, i);
+      if (!cfg.ok) { setState('error', '配置失败: ' + (cfg.err || '')); log('error', '  配置失败: ' + (cfg.err || '')); return; }
+
+      const res = await submitOrder(q, token);
+      if (!res.ok) { setState('error', res.msg || '下单失败'); log('error', '  下单失败: ' + (res.msg || '')); return; }
+
+      q.buys = (q.buys || 0) + 1;
+      q.invoiceId = res.invoiceId;
+      q.lastBuyMs = Date.now() - t0;
+      setState('bought', '发票 ' + res.invoiceId + ' · ' + q.lastBuyMs + 'ms');
+      log('buy', '排队下单成功 · 发票 ' + res.invoiceId + ' · ' + q.lastBuyMs + 'ms');
+      if (DB.settings.pushOnBuy) push('VMISS 排队抢购成功', (q.label || ('pid ' + q.pid)) + '\n发票 #' + res.invoiceId + '\n耗时 ' + q.lastBuyMs + 'ms' + (q.genPw ? '\nroot 密码: ' + q.genPw : ''));
+      if (q.stopAfter) q.enabled = false;
+    } catch (e) {
+      log('error', '排队异常: ' + String(e.message || e));
+      q.stateText = '异常: ' + String(e.message || e).slice(0, 40);
+    } finally {
+      burst = false;
+      delete queueRunning[q.id];
+      persistQueues();
+      upd();
+    }
+  }
+
+  const QPAY = (v) => (v === 'balance' ? '余额' : v === 'motionpayalipay' ? '支付宝' : v === 'cryptomusgateway' ? '加密货币' : '信用卡');
+
+  UI.renderQueue = function () {
+    if (!root || UI.tab !== 'queue') return;
+    const bd = root.querySelector('#vp-bd');
+    const list = DB.queues || [];
+    let h = '<div class="act"><button class="b g" id="q-add">+ 添加排队任务</button>' +
+      (list.length ? '<button class="b" id="q-allon">全部启用</button><button class="b" id="q-alloff">全部暂停</button>' : '') + '</div>';
+    h += '<div class="hint" style="margin-bottom:9px;line-height:1.7">' +
+      '<b style="color:#2dd4bf">VMISS 新版排队购买</b>：先在排队页排队 → 轮到你了 → 才有资格进购物车（限时）。<br>' +
+      '这里填商品 <b>pid</b>，插件会盯着排队状态，一拿到入场资格就立刻加购下单。<br>' +
+      '<span style="color:#fbbf24">注意</span>：排队页需要账号已登录，且部分商品要求历史消费额（ineligible 就是这条）。</div>';
+    if (!list.length) {
+      h += '<div class="empty">还没有排队任务<br><span style="color:#5a5a64">点「+ 添加排队任务」，填商品 pid（链接里 pid= 后面那个数字）</span></div>';
+      bd.innerHTML = h; bind(bd); return;
+    }
+    for (const q of list) {
+      const busy = !!queueRunning[q.id];
+      const cls = ['granted', 'bought', 'error', 'skip', 'out'].indexOf(q.state) >= 0 ? q.state : '';
+      h += '<div class="m"><div class="r1"><span class="nm" title="' + esc(q.label || '') + '">' + esc(q.label || ('pid ' + q.pid) ) + '</span>' +
+        '<span class="pr">pid ' + q.pid + '</span></div>' +
+        '<div class="r2"><span>' + Math.round((q.intervalMs || 30000) / 1000) + 's 巡检</span><span>' + QPAY(q.paymentMethod) + '</span>' +
+        (function () {
+          if (q.useCoupon === false) return '';
+          const c = (q.couponCode || '').trim() || (DB.settings.defaultCoupon || '').trim();
+          return c ? '<span style="color:#fbbf24">' + esc(c) + ((q.couponCode || '').trim() ? '' : ' 默认') + '</span>' : '<span style="color:#6f6f7a">无码</span>';
+        })() +
+        '<span>检查 ' + (q.checks || 0) + '</span><span>成交 ' + (q.buys || 0) + '</span>' +
+        (q.lastBuyMs ? '<span style="color:#34d399">' + q.lastBuyMs + 'ms</span>' : '') +
+        '<span>' + ago(q.lastCheck) + '</span></div>' +
+        '<div class="st ' + cls + '">' + (busy ? '[跑] ' : '') + esc(q.stateText || (q.enabled ? '等待首次检查' : '已暂停')) + '</div>' +
+        (q.genPw ? '<div class="st" style="background:rgba(45,212,191,.12);color:#2dd4bf;cursor:pointer" data-a="copy" data-id="' + q.id + '" title="点一下复制">root 密码 ' + esc(q.genPw) + '（点击复制）</div>' : '') +
+        '<div class="r3">' +
+        '<button class="b sm' + (q.enabled ? '' : ' g') + '" data-qa="toggle" data-qid="' + q.id + '">' + (q.enabled ? '暂停' : '启用') + '</button>' +
+        '<button class="b sm" data-qa="once" data-qid="' + q.id + '">立即检查</button>' +
+        '<button class="b sm" data-qa="edit" data-qid="' + q.id + '">配置</button>' +
+        '<button class="b sm d" data-qa="del" data-qid="' + q.id + '">删除</button></div></div>';
+    }
+    bd.innerHTML = h;
+    bind(bd);
+  };
+
+  function openQueueEditor(existing) {
+    const base = existing || {
+      id: nextId(), pid: 0, label: '',
+      intervalMs: 30000, pollMs: 3000, watchMs: 180000,
+      paymentMethod: 'motionpayalipay', useBalance: false,
+      couponCode: DB.settings.defaultCoupon || '', useCoupon: true,
+      hostname: '', rootPassword: '', ns1Prefix: '', ns2Prefix: '', options: {},
+      stopAfter: true, enabled: true, checks: 0, buys: 0,
+      stateText: '', state: '', lastCheck: 0, nextAt: 0,
+    };
+    const dlg = document.createElement('div');
+    dlg.className = 'dlg';
+    dlg.innerHTML = '<div class="c"><h4>' + (existing ? '编辑排队任务' : '添加排队任务') + '</h4>' +
+      '<label class="f"><span>商品 pid</span><input id="q_pid" type="number" placeholder="链接里 pid= 后面的数字，例如 32" value="' + (base.pid || '') + '"></label>' +
+      '<label class="f"><span>备注名（留空自动从页面取）</span><input id="q_label" placeholder="例如 US.LA.TRI.Basic" value="' + esc(base.label || '') + '"></label>' +
+      '<div class="g2"><label class="f"><span>巡检间隔（秒）</span><input id="q_iv" type="number" min="10" value="' + Math.round((base.intervalMs || 30000) / 1000) + '"></label>' +
+      '<label class="f"><span>队列内轮询（毫秒）</span><input id="q_poll" type="number" min="1000" step="500" value="' + (base.pollMs || 3000) + '"></label></div>' +
+      '<label class="f"><span>单次最多盯多久（秒）</span><input id="q_watch" type="number" min="30" value="' + Math.round((base.watchMs || 180000) / 1000) + '">' +
+      '<div class="hint" style="margin-top:5px">拿到入场资格的窗口很短，这里决定一轮里最多轮询多久。默认 180 秒。</div></label>' +
+      '<label class="f"><span>支付方式</span><select id="q_pay">' +
+      '<option value="motionpayalipay"' + (base.paymentMethod === 'motionpayalipay' ? ' selected' : '') + '>支付宝（只锁单，推二维码）</option>' +
+      '<option value="cryptomusgateway"' + (base.paymentMethod === 'cryptomusgateway' ? ' selected' : '') + '>加密货币（只锁单）</option>' +
+      '<option value="stripe"' + (base.paymentMethod === 'stripe' ? ' selected' : '') + '>信用卡（只锁单）</option>' +
+      '<option value="balance"' + (base.paymentMethod === 'balance' ? ' selected' : '') + '>余额（立即扣款）</option></select></label>' +
+      '<label class="f"><span>优惠码</span><input id="q_cp" placeholder="留空则用默认：' + esc(DB.settings.defaultCoupon || '（未设置）') + '" value="' + esc(base.couponCode || '') + '"></label>' +
+      '<label class="chk" style="margin:-4px 0 9px"><input type="checkbox" id="q_usecp"' + (base.useCoupon === false ? '' : ' checked') + '>本任务使用优惠码</label>' +
+      '<div class="g2"><label class="f"><span>主机名（留空自动生成）</span><input id="q_hn" placeholder="server.example.com" value="' + esc(base.hostname || '') + '"></label>' +
+      '<label class="f"><span>root 密码（必填，8~64 位）</span><input id="q_rp" placeholder="留空自动生成并显示" value="' + esc(base.rootPassword || '') + '"></label></div>' +
+      '<div class="g2"><label class="f"><span>NS1 / NS2 前缀</span><div style="display:flex;gap:6px"><input id="q_ns1" placeholder="ns1" value="' + esc(base.ns1Prefix || '') + '"><input id="q_ns2" placeholder="ns2" value="' + esc(base.ns2Prefix || '') + '"></div></label>' +
+      '<label class="f"><span>抢到后</span><select id="q_stop"><option value="1"' + (base.stopAfter ? ' selected' : '') + '>自动暂停</option><option value="0"' + (base.stopAfter ? '' : ' selected') + '>继续监控</option></select></label></div>' +
+      '<label class="chk"><input type="checkbox" id="q_bal"' + (base.useBalance ? ' checked' : '') + '>允许用余额支付（会立即扣款，谨慎勾选）</label>' +
+      '<div class="row"><button id="q_cancel">取消</button><button class="g" id="q_ok">' + (existing ? '保存' : '添加') + '</button></div></div>';
+    root.appendChild(dlg);
+    const g = (n) => dlg.querySelector('#' + n);
+    g('q_cancel').onclick = () => dlg.remove();
+    g('q_ok').onclick = () => {
+      const pid = Number(g('q_pid').value) || 0;
+      if (!pid) { log('error', 'pid 不能为空（链接里 pid= 后面那个数字）'); return; }
+      const item = {
+        id: base.id, pid,
+        label: g('q_label').value.trim() || base.label || '',
+        intervalMs: Math.max(10000, (Number(g('q_iv').value) || 30) * 1000),
+        pollMs: Math.max(1000, Number(g('q_poll').value) || 3000),
+        watchMs: Math.max(30000, (Number(g('q_watch').value) || 180) * 1000),
+        paymentMethod: g('q_pay').value,
+        useBalance: g('q_bal').checked,
+        couponCode: g('q_cp').value.trim(),
+        useCoupon: g('q_usecp').checked,
+        hostname: g('q_hn').value.trim(),
+        rootPassword: g('q_rp').value.trim(),
+        ns1Prefix: g('q_ns1').value.trim(),
+        ns2Prefix: g('q_ns2').value.trim(),
+        options: base.options || {},
+        stopAfter: g('q_stop').value === '1',
+        enabled: base.enabled === undefined ? true : base.enabled,
+        checks: base.checks || 0, buys: base.buys || 0,
+        stateText: base.stateText || '', state: base.state || '',
+        lastCheck: base.lastCheck || 0, nextAt: 0,
+      };
+      if (existing) {
+        DB.queues = DB.queues.map((x) => (x.id === item.id ? item : x));
+      } else {
+        DB.queues.push(item);
+      }
+      persistQueues();
+      dlg.remove();
+      log('info', '排队任务已保存 · pid ' + pid);
+      UI.renderQueue();
+    };
   }
 
   async function openEditor(existing, preset) {
@@ -1560,7 +1869,7 @@
         log('warn', '有新版本 ' + v + '（当前 ' + LATEST + '），请更新脚本');
         push('VMISS 抢购助手有新版', '当前 ' + LATEST + ' → 新版 ' + v);
       }
-    } catch (e) {  }
+    } catch (e) { /* 静默 */ }
   }
 
   function boot() {
