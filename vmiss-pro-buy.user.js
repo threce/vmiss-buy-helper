@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VMISS 抢购助手
 // @namespace    vmiss-pro
-// @version      3.4.0
+// @version      3.5.0
 // @description  VMISS 库存监控与自动抢购：商品浏览、配置项、优惠码、推送，全部在插件内
 // @author       VMISS PRO
 // @license      MIT
@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const LATEST = '3.4.0';
+  const LATEST = '3.5.0';
   const VERSION_URL = '';
 
   const K = (n) => 'vmiss_v3_' + n;
@@ -291,15 +291,93 @@
 
   const CF_WINDOW = 10 * 60 * 1000;
   const CF_MAX = 6;
+  const CF_DAY = 24 * 3600 * 1000;
 
-  function cfLoad() {
-    const s = load('cfStat', null);
-    if (!s || !s.at || Date.now() - s.at > CF_WINDOW) return { at: 0, n: 0, okAt: 0, warned: 0 };
+  function fmtDur(ms) {
+    if (!ms || ms < 0) return '—';
+    const sec = Math.round(ms / 1000);
+    if (sec < 90) return sec + ' 秒';
+    const m = Math.round(ms / 60000);
+    if (m < 60) return m + ' 分钟';
+    const h = Math.floor(m / 60);
+    const mm = m % 60;
+    return h + ' 小时' + (mm ? ' ' + mm + ' 分' : '');
+  }
+
+  function cfData() {
+    const s = load('cfStat', null) || {};
+    if (!Array.isArray(s.lives)) s.lives = [];
+    if (!Array.isArray(s.events)) s.events = [];
     return s;
   }
+
+  function cfSegStart() {
+    const s = cfData();
+    s.segStart = Date.now();
+    s.epActive = 0;
+    save('cfStat', s);
+  }
+
+  function cfNoteExpire(why) {
+    const s = cfData();
+    const now = Date.now();
+    if (s.epActive) return 0;
+    s.epActive = 1;
+    let life = 0;
+    if (s.segStart && now > s.segStart) {
+      const d = now - s.segStart;
+      if (d >= 30000) { life = d; s.lives.push(d); if (s.lives.length > 20) s.lives.shift(); }
+    }
+    s.segStart = 0;
+    s.events.push(now);
+    s.events = s.events.filter((t) => now - t < CF_DAY).slice(-200);
+    s.lastExpireAt = now;
+    s.lastExpireWhy = String(why || '').slice(0, 80);
+    save('cfStat', s);
+    if (life) log('info', '  ⏱ 这次 clearance 维持了 ' + fmtDur(life) + '（已计入统计）');
+    return life;
+  }
+
   function cfMarkOk() {
-    const s = load('cfStat', null);
-    if (s && s.n) { s.n = 0; s.warned = 0; s.okAt = Date.now(); save('cfStat', s); }
+    const s = cfData();
+    let dirty = false;
+    if (s.n) { s.n = 0; s.warned = 0; s.okAt = Date.now(); dirty = true; }
+    if (s.epActive) { s.epActive = 0; dirty = true; }
+    if (!s.segStart) { s.segStart = Date.now(); dirty = true; }
+    if (dirty) save('cfStat', s);
+  }
+
+  function cfStatsHtml() {
+    const s = cfData();
+    const now = Date.now();
+    const lives = s.lives || [];
+    const ev = (s.events || []).filter((t) => now - t < CF_DAY);
+    const lasts = lives.length ? lives[lives.length - 1] : 0;
+    const avg = lives.length ? Math.round(lives.reduce((a, b) => a + b, 0) / lives.length) : 0;
+    const mx = lives.length ? Math.max.apply(null, lives) : 0;
+    const mn = lives.length ? Math.min.apply(null, lives) : 0;
+    const alive = s.segStart ? now - s.segStart : 0;
+    const row = (k, v, color) => '<div style="display:flex;justify-content:space-between;padding:2px 0">' +
+      '<span style="color:#6f6f7a">' + k + '</span><span style="color:' + (color || '#c9c9d1') + '">' + v + '</span></div>';
+    let h = '<div style="margin:10px 0 6px;font-size:11.5px;color:#2dd4bf;font-weight:600">Cloudflare 验证统计</div>';
+    h += '<div style="background:#0d0d10;border:1px solid #1c1c22;border-radius:6px;padding:8px 10px;font-size:11.5px;line-height:1.7">';
+    if (!lives.length && !s.segStart && !ev.length) {
+      h += '<div style="color:#6f6f7a">还没有数据。挂一段时间后这里会显示 cf_clearance 大概能维持多久。</div>';
+    } else {
+      h += row('当前状态', s.segStart ? ('健康 · 已维持 ' + fmtDur(alive)) : '已过期 / 等待续期',
+        s.segStart ? '#34d399' : '#fbbf24');
+      h += row('上次维持', lasts ? fmtDur(lasts) : '—');
+      h += row('平均（最近 ' + lives.length + ' 次）', avg ? fmtDur(avg) : '—');
+      h += row('最长 / 最短', mx ? (fmtDur(mx) + ' / ' + fmtDur(mn)) : '—');
+      h += row('近 24 小时验证次数', ev.length + ' 次', ev.length >= 10 ? '#fbbf24' : '#c9c9d1');
+      if (s.lastExpireAt) h += row('上次过期', ago(s.lastExpireAt) + '（' + String(s.lastExpireWhy || '').slice(0, 24) + '）');
+      const est = avg || lasts;
+      if (est) h += row('预估下次过期', fmtDur(Math.max(0, est - alive)), '#fbbf24');
+    }
+    h += '</div>';
+    h += '<div style="margin-top:6px"><button class="b sm" id="cf_reset">重置统计</button>' +
+      '<span class="hint" style="margin-left:8px">样本越多越准。看着像「只能维持十几分钟」就说明该换 IP 或降频了。</span></div>';
+    return h;
   }
 
   let cfTimer = null;
@@ -308,7 +386,10 @@
     if (kind === 'waf') return;
     if (isChallengePage()) return;
     if (cfTimer) return;
-    const s = cfLoad();
+    cfNoteExpire(where);
+    const s = cfData();
+
+    if (!s.at || Date.now() - s.at > CF_WINDOW) { s.n = 0; s.warned = 0; s.at = Date.now(); }
     if (s.n >= CF_MAX) {
       if (!s.warned) {
         s.warned = 1; s.at = s.at || Date.now(); save('cfStat', s);
@@ -1181,6 +1262,7 @@
       '<div class="hint" style="margin-top:5px">命中 Cloudflare 挑战时自动刷新页面，让浏览器自己去过验证（只有页面导航才会触发 CF 自动验证，fetch 不会）。10 分钟内最多重载 6 次，超了就推送告警。</div></label>' +
       '<label class="f"><span>CF 空闲心跳</span><select id="s10"><option value="1"' + (s.cfHeartbeat === false ? '' : ' selected') + '>开（推荐）</option><option value="0"' + (s.cfHeartbeat === false ? ' selected' : '') + '>关</option></select>' +
       '<div class="hint" style="margin-top:5px">空闲时每分钟请求一次 clientarea.php，提前发现 cf_clearance 过期。有监控/排队在跑或标签页在后台时不发。</div></label>' +
+      '<div id="cfstat">' + cfStatsHtml() + '</div>' +
       '<label class="f"><span>默认优惠码</span><input id="s7" placeholder="10%OFF" value="' + esc(s.defaultCoupon) + '">' +
       '<div class="hint" style="margin-top:5px">默认使用优惠码 <b style="color:#fbbf24">10%OFF</b>（全场通用）。新加的监控会自动填上，留空即不使用。</div></label>' +
       '<label class="f"><span>同时处理几笔下单</span><input id="s3" type="number" min="1" max="5" value="' + s.maxConcurrent + '"></label>' +
@@ -1276,6 +1358,13 @@
       if (t.id === 'vp-gobrowse') { UI.tab = 'browse'; UI.syncTabs(); UI.render(); return; }
       if (t.id === 'vp-allon') { DB.monitors.forEach((x) => { x.enabled = true; x.nextAt = 0; }); persist(); UI.renderMonitors(); UI.renderStatus(); return; }
       if (t.id === 'vp-alloff') { DB.monitors.forEach((x) => { x.enabled = false; }); persist(); UI.renderMonitors(); UI.renderStatus(); return; }
+      if (t.id === 'cf_reset') {
+        const cur = cfData();
+        save('cfStat', { at: cur.at || 0, n: cur.n || 0, warned: cur.warned || 0, segStart: cur.segStart || 0, okAt: cur.okAt || 0 });
+        log('info', 'CF 统计已重置');
+        UI.renderSettings();
+        return;
+      }
       if (t.id === 'vp-clearlog') { DB.logs.length = 0; UI.renderLogs(); return; }
       if (t.id === 'vp-clear') {
       DB.catalog = { at: 0, catsAt: 0, cats: [], products: [] };
@@ -2319,6 +2408,7 @@
   function boot() {
 
     if (isChallengePage()) { waitChallengePass(); return; }
+    cfSegStart();
     root = shell();
     UI.ready = true;
     UI.render();
@@ -2330,6 +2420,10 @@
       UI.renderStatus();
       if (UI.tab === 'monitors') UI.renderMonitors();
       if (UI.tab === 'logs') UI.renderLogs();
+      if (UI.tab === 'settings') {
+        const box = root.querySelector('#cfstat');
+        if (box) box.innerHTML = cfStatsHtml();
+      }
     }, 2000);
     log('info', '=== VMISS 抢购助手 v' + LATEST + ' 已就绪（MIT 许可）===');
     log('info', '监控 ' + DB.monitors.length + ' 项 · 目录 ' + (DB.catalog.products.length || 0) + ' 商品');
