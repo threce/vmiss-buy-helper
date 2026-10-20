@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VMISS 抢购助手
 // @namespace    vmiss-pro
-// @version      3.2.1
+// @version      3.2.2
 // @description  VMISS 库存监控与自动抢购：商品浏览、配置项、优惠码、推送，全部在插件内
 // @author       VMISS PRO
 // @license      MIT
@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const LATEST = '3.2.1';
+  const LATEST = '3.2.2';
   const VERSION_URL = '';
 
   const K = (n) => 'vmiss_v3_' + n;
@@ -67,6 +67,7 @@
     pushOnRestock: true, pushOnBuy: true, pushOnError: false,
     seenIntro: false, lastVersion: '',
     fetchAllGapMs: 6000,
+    reqTimeoutMs: 20000,
   };
   (function migrate() {
     let changed = false;
@@ -223,25 +224,59 @@
     const method = (init && init.method) || 'GET';
     const seq = String(++reqSeq).padStart(3, ' ');
     const t0 = Date.now();
+    const toMs = Math.max(3000, Number(DB.settings.reqTimeoutMs) || 20000);
+    const bodyStr = init && init.body ? String(init.body) : '';
+
+    if (trace) {
+      log('info', '  #' + seq + ' → ' + method + ' ' + path + (bodyStr ? '\n         请求体 ' + redact(bodyStr).slice(0, 200) : ''));
+    }
+
+    const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+    let timedOut = false;
+    const tm = ctl ? setTimeout(() => { timedOut = true; try { ctl.abort(); } catch (e) { /* ignore */ } }, toMs) : null;
     let res;
     try {
-      res = await fetch(location.origin + path, Object.assign({ credentials: 'include', redirect: 'follow' }, init || {}));
+      res = await fetch(location.origin + path, Object.assign(
+        { credentials: 'include', redirect: 'follow' }, init || {}, ctl ? { signal: ctl.signal } : {},
+      ));
     } catch (e) {
-      if (trace) log('error', '  ' + seq + ' ' + method + ' ' + path.slice(0, 44) + ' 网络错误: ' + e.message);
-      throw e;
+      if (tm) clearTimeout(tm);
+      const ms = Date.now() - t0;
+      const why = timedOut ? ('超时 ' + toMs + 'ms 未返回，已中断') : ('网络错误: ' + (e.message || e));
+      if (trace) log('error', '  #' + seq + ' ✗ ' + method + ' ' + path.slice(0, 60) + '\n         ' + why + ' · 耗时 ' + ms + 'ms');
+      throw new Error(why);
     }
-    const text = await res.text();
+    if (tm) clearTimeout(tm);
+
+    let text = '';
+    try {
+      text = await res.text();
+    } catch (e) {
+      if (trace) log('error', '  #' + seq + ' ✗ 读取响应体失败: ' + (e.message || e));
+      throw new Error('读取响应体失败: ' + (e.message || e));
+    }
     const ms = Date.now() - t0;
     const verdict = cfVerdict(res.status, text);
+
     if (trace) {
-      let flag = 'OK';
+      const ct = String((res.headers && res.headers.get('content-type')) || '').split(';')[0].trim();
       let lv = 'info';
-      if (verdict) { flag = verdict.text.slice(0, 14); lv = 'warn'; }
-      if (verdict && verdict.ray) flag += ' Ray=' + verdict.ray;
-      log(lv, '  ' + seq + ' ' + method.padEnd(4) + ' ' + path.slice(0, 44) + ' -> ' + res.status + ' ' + fmtBytes(text.length) + ' ' + ms + 'ms ' + flag);
+      let mark = '✓';
+      if (verdict) { lv = 'warn'; mark = '⚠'; }
+      if (res.status >= 400) { lv = res.status >= 500 ? 'error' : 'warn'; mark = '✗'; }
+      let line = '  #' + seq + ' ' + mark + ' ' + method + ' ' + path.slice(0, 70) +
+        '\n         ← HTTP ' + res.status + ' · ' + fmtBytes(text.length) + ' · ' + ms + 'ms' +
+        (ct ? ' · ' + ct : '') +
+        ' · 落地 ' + String(res.url || '').replace(location.origin, '').slice(0, 60);
+      if (verdict) line += '\n         CF: ' + verdict.kind + ' — ' + verdict.text + (verdict.ray ? ' · Ray ' + verdict.ray : '');
+      const t = text.trim();
+      if ((t.charAt(0) === '{' || t.charAt(0) === '[') && t.length <= 600) line += '\n         响应 ' + redact(t);
+      log(lv, line);
     }
     return { status: res.status, text, url: res.url, verdict };
   }
+
+  const redact = (s) => String(s || '').replace(/(token|rootpw|password2?|loginpassword|access_token)=([^&\s"]{0,4})[^&\s"]*/gi, '$1=$2***');
 
   const post = (path, obj) => req(path, {
     method: 'POST',
@@ -1052,6 +1087,8 @@
       '<label class="f"><span>默认检查间隔（秒）</span><input id="s1" type="number" min="5" value="' + (s.defaultIntervalMs / 1000) + '"></label>' +
       '<label class="f"><span>监控请求间隔（秒，别低于 1.5）</span><input id="s2" type="number" min="1.5" step="0.1" value="' + (s.minGapMs / 1000) + '"></label>' +
       '<label class="f"><span>抢购爆发间隔（毫秒，越小越快越易限速）</span><input id="s5" type="number" min="0" max="2000" step="50" value="' + s.burstGapMs + '"></label>' +
+      '<label class="f"><span>单请求超时（毫秒）</span><input id="s8" type="number" min="3000" step="1000" value="' + (s.reqTimeoutMs || 20000) + '">' +
+      '<div class="hint" style="margin-top:5px">超过这个时间没响应就中断并报错。没有超时的话，连接一挂住任务会静默卡死（卡片还显示 [跑]）。默认 20000。</div></label>' +
       '<label class="f"><span>默认优惠码</span><input id="s7" placeholder="10%OFF" value="' + esc(s.defaultCoupon) + '">' +
       '<div class="hint" style="margin-top:5px">默认使用优惠码 <b style="color:#fbbf24">10%OFF</b>（全场通用）。新加的监控会自动填上，留空即不使用。</div></label>' +
       '<label class="f"><span>同时处理几笔下单</span><input id="s3" type="number" min="1" max="5" value="' + s.maxConcurrent + '"></label>' +
@@ -1140,6 +1177,7 @@
         DB.settings.defaultIntervalMs = Math.max(5000, Number(g('s1').value) * 1000 || 30000);
         DB.settings.minGapMs = Math.max(1500, Number(g('s2').value) * 1000 || 1700);
         DB.settings.burstGapMs = Math.min(2000, Math.max(0, Number(g('s5').value)));
+        DB.settings.reqTimeoutMs = Math.max(3000, Number(g('s8').value) || 20000);
         DB.settings.defaultCoupon = g('s7').value.trim();
         DB.settings.maxConcurrent = Math.min(5, Math.max(1, Number(g('s3').value) || 1));
         DB.settings.prewarmCsrf = g('s6').value === '1';
@@ -1385,90 +1423,153 @@
     trace = 'Q' + q.pid;
     const upd = () => { if (UI.ready && UI.tab === 'queue') UI.renderQueue(); };
     const setState = (s, txt) => { q.state = s; q.stateText = txt; upd(); };
+
+    const fail = (why, kind) => {
+      setState(kind || 'error', why);
+      log('error', '  ✗ ' + why);
+      if (DB.settings.pushOnError) push('VMISS 排队失败', (q.label || ('pid ' + q.pid)) + ' · pid ' + q.pid + '\n' + why);
+    };
     try {
       q.lastCheck = Date.now();
       q.checks = (q.checks || 0) + 1;
       log('info', '> 排队 pid ' + q.pid + (q.label ? '（' + q.label + '）' : ''));
       upd();
 
+      log('info', '  会话令牌 ' + (await csrf()).slice(0, 8) + '…');
       const token = await csrf();
-      if (!token) { setState('error', '拿不到会话令牌'); return; }
+      if (!token) { fail('拿不到会话令牌（未登录或 CF 拦了 clientarea.php）'); return; }
 
       let pg = await queuePage(q.pid);
       for (let a = 1; a <= 2 && pg.limited; a += 1) {
-        log('warn', '  排队页限速 HTTP ' + pg.status + '，等 ' + (a * 8) + 's');
-        setState('skip', '排队页限速中');
+        log('warn', '  排队页限速 HTTP ' + pg.status + '，等 ' + (a * 8) + 's 重试（' + a + '/2）');
+        setState('skip', '排队页限速中 · 第 ' + a + ' 次重试');
         await sleep(a * 8000); lastReqAt = 0;
         pg = await queuePage(q.pid);
       }
-      if (!pg.ok) { setState('error', pg.gone ? '排队页不存在（pid 错或已下架）' : ('拿不到排队页 HTTP ' + (pg.status || '?'))); return; }
+      if (!pg.ok) {
+        fail(pg.gone
+          ? '排队页不存在 —— pid ' + q.pid + ' 可能错了，或该商品已下架'
+          : ('连续拿不到排队页 · 最后 HTTP ' + (pg.status || '?') + ' · 页面 ' + fmtBytes(pg.len || 0)));
+        return;
+      }
 
       q.pollUrl = pg.poll;
       q.cartUrl = pg.cart;
       if (pg.note && !q.label) q.label = pg.note;
+      log('info', '  解析排队页 OK' +
+        '\n         状态接口 ' + pg.poll +
+        '\n         加购地址 ' + pg.cart +
+        '\n         页面初始状态 ' + (pg.lastState || '(空)') +
+        '\n         加入表单 ' + (pg.form
+          ? ('有 · action=' + (pg.form.action || '(同页)') + ' · ' + Object.keys(pg.form.fields).length + ' 个字段: ' + Object.keys(pg.form.fields).join(','))
+          : '无（队列可能未开放）'));
 
       const pollMs = Math.max(1000, Number(q.pollMs) || 3000);
       const maxTurns = Math.max(3, Math.ceil((Number(q.watchMs) || 120000) / pollMs));
       let st = null;
       let joins = 0;
 
+      log('info', '  开始轮询 · 间隔 ' + pollMs + 'ms · 最多 ' + maxTurns + ' 轮（约 ' + Math.round(maxTurns * pollMs / 1000) + 's）');
+      let prevState = '';
       for (let k = 0; k < maxTurns; k += 1) {
+        const pt = Date.now();
         st = await queueStatus(pg.poll);
+        const pms = Date.now() - pt;
+
         if (!st.ok) {
-          if (st.limited) { setState('skip', '状态接口限速'); await sleep(6000); lastReqAt = 0; continue; }
-          setState('error', '状态接口异常: ' + (st.text || ''));
+          if (st.limited) {
+            log('warn', '  [' + (k + 1) + '/' + maxTurns + '] 状态接口限速 HTTP ' + st.status + '，等 6s');
+            setState('skip', '状态接口限速（第 ' + (k + 1) + ' 轮）');
+            await sleep(6000); lastReqAt = 0; continue;
+          }
+          fail('状态接口返回的不是 JSON · ' + (st.text || '(空)'));
           return;
         }
+
+        const aheadTxt = st.ahead === null || st.ahead === undefined ? '-' : String(st.ahead);
+        log('info', '  [' + (k + 1) + '/' + maxTurns + '] state=' + st.state +
+          ' · 前面 ' + aheadTxt + ' 位 · 剩余 ' + (st.remaining || 0) + 's · ' + pms + 'ms');
+        if (prevState && prevState !== st.state) log('warn', '  ◆ 状态变化: ' + prevState + ' → ' + st.state);
+        prevState = st.state;
+
         q.state = st.state;
         q.ahead = st.ahead;
         q.remaining = st.remaining;
 
-        if (st.state === 'granted') { setState('granted', '入场资格到手 · 剩余 ' + (st.remaining || 0) + 's'); break; }
-        if (st.state === 'waiting') setState('waiting', '排队中 · 前面 ' + (st.ahead === null || st.ahead === undefined ? '?' : st.ahead) + ' 位');
-        else if (st.state === 'closed') { setState('closed', '队列未开放'); return; }
-        else if (st.state === 'ineligible') { setState('error', '账号不满足购买资格（看历史消费额）'); return; }
-        else if (st.state === 'invalid_link') { setState('error', '排队链接已失效，需找 VMISS 要新链接'); return; }
-        else if (st.state === 'processing') { setState('processing', '结账处理中'); return; }
-        else if (st.state === 'not_joined') {
+        if (st.state === 'granted') {
+          setState('granted', '入场资格到手 · 剩余 ' + (st.remaining || 0) + 's');
+          log('stock', '  ⚡ 拿到入场资格 · 第 ' + (k + 1) + ' 轮检测到 · 剩余 ' + (st.remaining || 0) + 's');
+          break;
+        }
+        if (st.state === 'waiting') {
+          setState('waiting', '排队中 · 前面 ' + aheadTxt + ' 位');
+        } else if (st.state === 'closed') {
+          setState('closed', '队列未开放');
+          log('info', '  队列未开放，本轮结束（下次 ' + Math.round((q.intervalMs || 30000) / 1000) + 's 后再查）');
+          return;
+        } else if (st.state === 'ineligible') {
+          fail('账号不满足购买资格 —— 官方要求最低历史消费额（Gross Revenue），换个号或先消费一次');
+          return;
+        } else if (st.state === 'invalid_link') {
+          fail('排队链接已失效 —— 需要找 VMISS 索取当前链接');
+          return;
+        } else if (st.state === 'processing') {
+          setState('processing', '结账处理中（上一笔还没走完）');
+          log('warn', '  服务端说还在 processing，跳过本轮');
+          return;
+        } else if (st.state === 'not_joined') {
           if (pg.form && joins < 3) {
-            const j = await queueJoin(pg, q.pid, token);
             joins += 1;
-            log('info', '  提交加入队列表单 → ' + (j.ok ? '已提交' : 'HTTP ' + j.status));
+            log('info', '  检测到 not_joined 且有表单 → 提交加入队列（第 ' + joins + ' 次）· ' + Object.keys(pg.form.fields).length + ' 个字段');
+            const j = await queueJoin(pg, q.pid, token);
+            log(j.ok ? 'info' : 'warn', '  加入结果: ' + (j.ok ? '已提交 HTTP ' + j.status : 'HTTP ' + j.status));
             setState('not_joined', '正在加入队列（第 ' + joins + ' 次）');
             await sleep(1500); lastReqAt = 0;
             continue;
           }
-          setState('not_joined', pg.form ? '加入表单提交失败' : '页面没有加入表单（队列可能刚落开）');
-        } else setState('error', '未知状态: ' + st.state);
+          setState('not_joined', pg.form ? '加入表单连提 3 次仍失败' : '页面没有加入表单（队列可能刚落开，下轮再试）');
+          log('warn', '  ' + (pg.form ? '加入表单提交 3 次都失败' : '页面没有表单，等下一轮'));
+        } else {
+          fail('遇到未知状态: ' + st.state + '（官方可能加了新状态）');
+          return;
+        }
 
         await sleep(pollMs);
       }
 
       if (!st || st.state !== 'granted') {
-        if (st && st.state === 'waiting') setState('waiting', '本轮没轮到，下次继续');
+        if (st && st.state === 'waiting') {
+          setState('waiting', '本轮没轮到（跑了 ' + maxTurns + ' 轮），下次继续');
+          log('info', '  本轮 ' + maxTurns + ' 轮仍未轮到 · 退出，等下次巡检');
+        } else {
+          log('warn', '  轮询结束但没拿到 granted · 最后状态 ' + (st ? st.state : '(无)'));
+        }
         return;
       }
 
       burst = true;
-      log('stock', '  ⚡ 入场资格到手，剩余 ' + (st.remaining || 0) + 's，立刻下单');
+      log('stock', '  ⚡ 入场资格到手 · 剩余 ' + (st.remaining || 0) + 's · 切换到爆发模式（间隔 ' + DB.settings.burstGapMs + 'ms）');
       if (DB.settings.pushOnRestock) push('VMISS 排队轮到你了', (q.label || ('pid ' + q.pid)) + ' · 剩余 ' + (st.remaining || 0) + 's');
 
+      log('info', '  第 1 步 / 加购 → ' + pg.cart);
       const addR = await req(qpath(pg.cart));
       const i = (addR.text.match(/name="i"[^>]*value="(\d+)"/) || [])[1];
       if (!i) {
-        const oos = /out of stock|缺货|sold out/i.test(addR.text);
-        setState('out', oos ? '加购失败：缺货' : ('加购失败 HTTP ' + addR.status));
-        log('error', '  加购失败 HTTP ' + addR.status + (oos ? ' · 缺货' : ''));
+        const oos = /out of stock|缺货|sold out|Sold Out/i.test(addR.text);
+        fail(oos ? '加购失败：商品缺货' : ('加购失败 HTTP ' + addR.status + ' · 没找到购物车条目 i'), 'out');
         return;
       }
-      log('info', '  已加购 i=' + i);
+      log('info', '  第 1 步 / 加购成功 · 购物车条目 i=' + i);
       upd();
 
+      log('info', '  第 2 步 / 提交商品配置');
       const cfg = await configure(q, token, i);
-      if (!cfg.ok) { setState('error', '配置失败: ' + (cfg.err || '')); log('error', '  配置失败: ' + (cfg.err || '')); return; }
+      if (!cfg.ok) { fail('配置失败: ' + (cfg.err || '(无详情)')); return; }
+      log('info', '  第 2 步 / 配置通过');
 
+      log('info', '  第 3 步 / 提交订单');
       const res = await submitOrder(q, token);
-      if (!res.ok) { setState('error', res.msg || '下单失败'); log('error', '  下单失败: ' + (res.msg || '')); return; }
+      if (!res.ok) { fail('下单失败: ' + (res.msg || '(无详情)')); return; }
 
       q.buys = (q.buys || 0) + 1;
       q.invoiceId = res.invoiceId;
@@ -1478,12 +1579,16 @@
       if (DB.settings.pushOnBuy) push('VMISS 排队抢购成功', (q.label || ('pid ' + q.pid)) + '\n发票 #' + res.invoiceId + '\n耗时 ' + q.lastBuyMs + 'ms' + (q.genPw ? '\nroot 密码: ' + q.genPw : ''));
       if (q.stopAfter) q.enabled = false;
     } catch (e) {
-      log('error', '排队异常: ' + String(e.message || e));
-      q.stateText = '异常: ' + String(e.message || e).slice(0, 40);
+      const why = '排队异常: ' + String(e.message || e);
+      log('error', '  ✗ ' + why);
+      q.stateText = '异常: ' + String(e.message || e).slice(0, 60);
+      if (DB.settings.pushOnError) push('VMISS 排队异常', (q.label || ('pid ' + q.pid)) + '\n' + String(e.message || e).slice(0, 200));
     } finally {
       burst = false;
       delete queueRunning[q.id];
       persistQueues();
+      const spent = Date.now() - t0;
+      log('info', '  ── 本轮结束 · ' + (spent / 1000).toFixed(1) + 's · 状态 ' + (q.state || '?') + ' · 累计检查 ' + (q.checks || 0) + ' 次 / 成交 ' + (q.buys || 0) + ' 笔');
       upd();
     }
   }
