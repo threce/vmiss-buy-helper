@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VMISS 抢购助手
 // @namespace    vmiss-pro
-// @version      3.5.0
+// @version      3.5.1
 // @description  VMISS 库存监控与自动抢购：商品浏览、配置项、优惠码、推送，全部在插件内
 // @author       VMISS PRO
 // @license      MIT
@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const LATEST = '3.5.0';
+  const LATEST = '3.5.1';
   const VERSION_URL = '';
 
   const K = (n) => 'vmiss_v3_' + n;
@@ -61,6 +61,10 @@
   };
 
   const SETTING_DEFAULTS = {
+    defaultIntervalMs: 30000,
+    minGapMs: 1700,
+    maxConcurrent: 1,
+    notify: true,
     defaultCoupon: '10%OFF',
     burstGapMs: 350,
     prewarmCsrf: true,
@@ -974,22 +978,22 @@
   };
 
   const CSS = [
-    '#vp{position:fixed;right:18px;bottom:18px;z-index:2147483000;width:480px;max-height:88vh;display:flex;flex-direction:column;',
+    '#vp{position:fixed;right:18px;bottom:18px;z-index:2147483000;width:480px;height:88vh;max-height:88vh;display:flex;flex-direction:column;',
     'font:12.5px/1.6 "Segoe UI","Microsoft YaHei",system-ui,sans-serif;color:#f2f2f4;background:#131316;border:1px solid #2c2c34;',
     'border-radius:12px;box-shadow:0 20px 56px rgba(0,0,0,.6);overflow:hidden}',
     '#vp *{box-sizing:border-box}',
-    '#vp .hd{display:flex;align-items:center;gap:9px;padding:11px 13px;background:#0d0d10;cursor:move;user-select:none}',
+    '#vp .hd{display:flex;align-items:center;gap:9px;padding:11px 13px;background:#0d0d10;cursor:move;user-select:none;flex:0 0 auto}',
     '#vp .hd .dot{width:8px;height:8px;border-radius:50%;background:#55555f;flex:0 0 auto}',
     '#vp .hd .dot.on{background:#2dd4bf;box-shadow:0 0 8px #2dd4bf}',
     '#vp .hd .dot.busy{background:#fbbf24;box-shadow:0 0 8px #fbbf24}',
     '#vp .hd .ttl{flex:1;font-weight:600;font-size:13px}',
     '#vp .hd .cnt{font-size:11px;color:#9a9aa5;font-variant-numeric:tabular-nums}',
     '#vp .hd button{background:none;border:0;color:#9a9aa5;cursor:pointer;font-size:15px;padding:2px 7px;line-height:1}',
-    '#vp .tabs{display:flex;background:#0d0d10;padding:0 8px;border-top:1px solid #1c1c22;overflow-x:auto;scrollbar-width:none}',
-    '#vp .tabs button{flex:1;background:none;border:0;border-bottom:2px solid transparent;color:#8a8a95;padding:9px 4px;font-size:12px;cursor:pointer;font-family:inherit}',
+    '#vp .tabs{display:flex;background:#0d0d10;padding:0 8px;border-top:1px solid #1c1c22;overflow-x:auto;scrollbar-width:none;flex:0 0 auto}',
+    '#vp .tabs button{flex:1 0 auto;background:none;border:0;border-bottom:2px solid transparent;color:#8a8a95;padding:9px 6px;font-size:12px;cursor:pointer;font-family:inherit;white-space:nowrap}',
     '#vp .tabs button.on{color:#2dd4bf;border-bottom-color:#2dd4bf}',
-    '#vp .bd{flex:1;overflow-y:auto;padding:12px 13px;min-height:200px}',
-    '#vp .ft{padding:8px 13px;border-top:1px solid #26262c;font-size:11px;color:#7d7d88;display:flex;gap:10px;align-items:center}',
+    '#vp .bd{flex:1 1 auto;overflow-y:auto;overflow-x:hidden;padding:12px 13px;min-height:0}',
+    '#vp .ft{padding:8px 13px;border-top:1px solid #26262c;font-size:11px;color:#7d7d88;display:flex;gap:10px;align-items:center;flex:0 0 auto}',
     '#vp button.b{background:#232329;border:1px solid #2f2f37;border-radius:6px;color:#d4d4da;padding:5px 10px;font-size:11.5px;cursor:pointer;font-family:inherit;white-space:nowrap}',
     '#vp button.b:hover{background:#2c2c34;color:#fff}',
     '#vp button.b.g{background:#0f766e;border-color:#0f766e;color:#fff}',
@@ -1074,6 +1078,7 @@
       el.querySelector('#vp-bd').style.display = hide ? 'none' : '';
       el.querySelector('#vp-tabs').style.display = hide ? 'none' : '';
       el.querySelector('#vp-ft').style.display = hide ? 'none' : '';
+      el.style.height = hide ? 'auto' : '88vh';
       el.style.maxHeight = hide ? 'none' : '88vh';
     };
     el.querySelector('#vp-tabs').onclick = (e) => {
