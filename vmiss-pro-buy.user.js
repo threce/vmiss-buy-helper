@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VMISS 抢购助手
 // @namespace    vmiss-pro
-// @version      3.5.1
+// @version      3.5.2
 // @description  VMISS 库存监控与自动抢购：商品浏览、配置项、优惠码、推送，全部在插件内
 // @author       VMISS PRO
 // @license      MIT
@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const LATEST = '3.5.1';
+  const LATEST = '3.5.2';
   const VERSION_URL = '';
 
   const K = (n) => 'vmiss_v3_' + n;
@@ -977,8 +977,10 @@
     return Math.round(s / 86400) + '天前';
   };
 
+  const PANEL_H = '44vh';
+
   const CSS = [
-    '#vp{position:fixed;right:18px;bottom:18px;z-index:2147483000;width:480px;height:88vh;max-height:88vh;display:flex;flex-direction:column;',
+    '#vp{position:fixed;right:18px;bottom:18px;z-index:2147483000;width:480px;height:' + PANEL_H + ';max-height:' + PANEL_H + ';display:flex;flex-direction:column;',
     'font:12.5px/1.6 "Segoe UI","Microsoft YaHei",system-ui,sans-serif;color:#f2f2f4;background:#131316;border:1px solid #2c2c34;',
     'border-radius:12px;box-shadow:0 20px 56px rgba(0,0,0,.6);overflow:hidden}',
     '#vp *{box-sizing:border-box}',
@@ -1078,8 +1080,8 @@
       el.querySelector('#vp-bd').style.display = hide ? 'none' : '';
       el.querySelector('#vp-tabs').style.display = hide ? 'none' : '';
       el.querySelector('#vp-ft').style.display = hide ? 'none' : '';
-      el.style.height = hide ? 'auto' : '88vh';
-      el.style.maxHeight = hide ? 'none' : '88vh';
+      el.style.height = hide ? 'auto' : PANEL_H;
+      el.style.maxHeight = hide ? 'none' : PANEL_H;
     };
     el.querySelector('#vp-tabs').onclick = (e) => {
       const t = e.target.closest('button');
