@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VMISS 抢购助手
 // @namespace    vmiss-pro
-// @version      3.2.2
+// @version      3.2.3
 // @description  VMISS 库存监控与自动抢购：商品浏览、配置项、优惠码、推送，全部在插件内
 // @author       VMISS PRO
 // @license      MIT
@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const LATEST = '3.2.2';
+  const LATEST = '3.2.3';
   const VERSION_URL = '';
 
   const K = (n) => 'vmiss_v3_' + n;
@@ -1372,13 +1372,34 @@
     return '/' + s;
   };
 
-  async function queuePage(pid) {
-    const r = await req('/index.php?m=vmiss_queue&pid=' + pid);
-    if (isBad(r.status, r.text)) return { limited: true, status: r.status, verdict: r.verdict };
+  async function queuePage(q) {
+    const entry = q.url ? qpath(q.url) : ('/index.php?m=vmiss_queue&pid=' + q.pid);
+    const r = await req(entry);
+    if (isBad(r.status, r.text)) return { limited: true, status: r.status, verdict: r.verdict, len: r.text.length };
+
+    if (/\/login\b/.test(String(r.url || '')) || /id="inputEmail"|Secure Client Login/i.test(r.text.slice(0, 40000))) {
+      return { needLogin: true, status: r.status, len: r.text.length, url: r.url };
+    }
     const doc = new DOMParser().parseFromString(r.text, 'text/html');
-    const vmq = doc.getElementById('vmq');
-    if (!vmq) return { gone: true, status: r.status };
-    const form = vmq.querySelector('form');
+
+    const vmq = doc.getElementById('vmq')
+      || doc.querySelector('[data-poll][data-cart]')
+      || doc.querySelector('[data-poll]')
+      || doc.querySelector('.vmq-wrap');
+    if (!vmq) return { gone: true, status: r.status, len: r.text.length };
+
+    let form = vmq.querySelector('form');
+    if (!form) {
+      for (const f of doc.querySelectorAll('form')) {
+        let hit = false;
+        for (const el of f.querySelectorAll('[name]')) {
+          if (/^vq_/i.test(el.getAttribute('name') || '')) { hit = true; break; }
+        }
+        if (!hit && /vmiss_queue|vq_/i.test(f.getAttribute('action') || '')) hit = true;
+        if (hit) { form = f; break; }
+      }
+    }
+
     let fields = null;
     if (form) {
       fields = {};
@@ -1388,15 +1409,33 @@
         if (fields[el.name] === undefined) fields[el.name] = el.value;
       }
     }
-    const sub = vmq.querySelector('.vmq-sub');
+    const sub = vmq.querySelector('.vmq-sub') || doc.querySelector('.vmq-sub');
+    const poll = vmq.getAttribute('data-poll');
+    const cart = vmq.getAttribute('data-cart');
     return {
       ok: true,
-      poll: vmq.getAttribute('data-poll') || ('index.php?m=vmiss_queue&pid=' + pid + '&vq_status=1'),
-      cart: vmq.getAttribute('data-cart') || ('cart.php?a=add&pid=' + pid),
+      entry,
+      poll: poll || ('index.php?m=vmiss_queue&pid=' + q.pid + '&vq_status=1'),
+      cart: cart || ('cart.php?a=add&pid=' + q.pid),
       lastState: vmq.getAttribute('data-last-state') || '',
+      hasPollAttr: !!poll,
+      hasCartAttr: !!cart,
       form: form ? { action: form.getAttribute('action') || '', fields } : null,
       note: sub ? sub.textContent.replace(/\s+/g, ' ').trim() : '',
     };
+  }
+
+  function normState(s) {
+    const t = String(s || '').toLowerCase().replace(/[\s-]+/g, '_');
+    if (!t) return '';
+    if (/grant|admit|your_?turn|it_?s_?your/.test(t)) return 'granted';
+    if (/not_?join|need_?join|pending_?join|join_?required/.test(t)) return 'not_joined';
+    if (/wait|queue_?pos|in_?line|in_?queue|queued/.test(t)) return 'waiting';
+    if (/inelig|not_?elig/.test(t)) return 'ineligible';
+    if (/invalid|expire|dead/.test(t)) return 'invalid_link';
+    if (/process/.test(t)) return 'processing';
+    if (/clos|shut|not_?open/.test(t)) return 'closed';
+    return t;
   }
 
   async function queueStatus(poll) {
@@ -1404,12 +1443,18 @@
     if (isBad(r.status, r.text)) return { limited: true, status: r.status };
     try {
       const d = JSON.parse(r.text);
-      return { ok: true, state: String(d.state || ''), ahead: d.ahead, remaining: d.remaining };
-    } catch (e) { return { bad: true, text: String(r.text).slice(0, 120) }; }
+      if (!d || typeof d !== 'object') throw new Error('响应不是对象');
+      const raw = d.state || d.status || d.phase || d.stage || '';
+      const ahead = d.ahead !== undefined ? d.ahead
+        : (d.position !== undefined ? d.position : (d.queue_position !== undefined ? d.queue_position : null));
+      const remaining = d.remaining !== undefined ? d.remaining
+        : (d.remaining_seconds !== undefined ? d.remaining_seconds : (d.ttl !== undefined ? d.ttl : 0));
+      return { ok: true, raw: String(raw), state: normState(raw), ahead, remaining };
+    } catch (e) { return { bad: true, text: String(r.text).slice(0, 160) }; }
   }
 
-  async function queueJoin(pg, pid, token) {
-    const act = pg.form.action && pg.form.action !== '#' ? pg.form.action : ('/index.php?m=vmiss_queue&pid=' + pid);
+  async function queueJoin(pg, q, token) {
+    const act = pg.form.action && pg.form.action !== '#' ? pg.form.action : pg.entry;
     const body = Object.assign({}, pg.form.fields);
     if (token && body.token === undefined) body.token = token;
     const r = await post(qpath(act), body);
@@ -1439,16 +1484,20 @@
       const token = await csrf();
       if (!token) { fail('拿不到会话令牌（未登录或 CF 拦了 clientarea.php）'); return; }
 
-      let pg = await queuePage(q.pid);
+      let pg = await queuePage(q);
       for (let a = 1; a <= 2 && pg.limited; a += 1) {
         log('warn', '  排队页限速 HTTP ' + pg.status + '，等 ' + (a * 8) + 's 重试（' + a + '/2）');
         setState('skip', '排队页限速中 · 第 ' + a + ' 次重试');
         await sleep(a * 8000); lastReqAt = 0;
-        pg = await queuePage(q.pid);
+        pg = await queuePage(q);
+      }
+      if (pg.needLogin) {
+        fail('未登录 VMISS —— 排队页被跳转到登录页。请先在浏览器里登录 app.vmiss.com，插件才能读到排队状态');
+        return;
       }
       if (!pg.ok) {
         fail(pg.gone
-          ? '排队页不存在 —— pid ' + q.pid + ' 可能错了，或该商品已下架'
+          ? ('排队页打开了但没有排队容器（#vmq / [data-poll]）—— pid ' + q.pid + ' 可能错了，或该商品已下架、排队模块改了结构')
           : ('连续拿不到排队页 · 最后 HTTP ' + (pg.status || '?') + ' · 页面 ' + fmtBytes(pg.len || 0)));
         return;
       }
@@ -1457,6 +1506,8 @@
       q.cartUrl = pg.cart;
       if (pg.note && !q.label) q.label = pg.note;
       log('info', '  解析排队页 OK' +
+        '\n         入口 ' + (q.url ? '自定义链接' : 'pid 拼接') + ' → ' + pg.entry +
+        '\n         容器检测 ' + (pg.hasPollAttr ? 'data-poll ✓' : 'data-poll ✗(用兜底)') + ' · ' + (pg.hasCartAttr ? 'data-cart ✓' : 'data-cart ✗(用兜底)') +
         '\n         状态接口 ' + pg.poll +
         '\n         加购地址 ' + pg.cart +
         '\n         页面初始状态 ' + (pg.lastState || '(空)') +
@@ -1487,7 +1538,7 @@
         }
 
         const aheadTxt = st.ahead === null || st.ahead === undefined ? '-' : String(st.ahead);
-        log('info', '  [' + (k + 1) + '/' + maxTurns + '] state=' + st.state +
+        log('info', '  [' + (k + 1) + '/' + maxTurns + '] state=' + st.state + (st.raw && st.raw !== st.state ? '(原始 "' + st.raw + '")' : '') +
           ' · 前面 ' + aheadTxt + ' 位 · 剩余 ' + (st.remaining || 0) + 's · ' + pms + 'ms');
         if (prevState && prevState !== st.state) log('warn', '  ◆ 状态变化: ' + prevState + ' → ' + st.state);
         prevState = st.state;
@@ -1521,7 +1572,7 @@
           if (pg.form && joins < 3) {
             joins += 1;
             log('info', '  检测到 not_joined 且有表单 → 提交加入队列（第 ' + joins + ' 次）· ' + Object.keys(pg.form.fields).length + ' 个字段');
-            const j = await queueJoin(pg, q.pid, token);
+            const j = await queueJoin(pg, q, token);
             log(j.ok ? 'info' : 'warn', '  加入结果: ' + (j.ok ? '已提交 HTTP ' + j.status : 'HTTP ' + j.status));
             setState('not_joined', '正在加入队列（第 ' + joins + ' 次）');
             await sleep(1500); lastReqAt = 0;
@@ -1614,7 +1665,9 @@
       const cls = ['granted', 'bought', 'error', 'skip', 'out'].indexOf(q.state) >= 0 ? q.state : '';
       h += '<div class="m"><div class="r1"><span class="nm" title="' + esc(q.label || '') + '">' + esc(q.label || ('pid ' + q.pid) ) + '</span>' +
         '<span class="pr">pid ' + q.pid + '</span></div>' +
-        '<div class="r2"><span>' + Math.round((q.intervalMs || 30000) / 1000) + 's 巡检</span><span>' + QPAY(q.paymentMethod) + '</span>' +
+        '<div class="r2"><span>' + Math.round((q.intervalMs || 30000) / 1000) + 's 巡检</span>' +
+        (q.url ? '<span style="color:#2dd4bf">自定义链接</span>' : '') +
+        '<span>' + QPAY(q.paymentMethod) + '</span>' +
         (function () {
           if (q.useCoupon === false) return '';
           const c = (q.couponCode || '').trim() || (DB.settings.defaultCoupon || '').trim();
@@ -1637,7 +1690,7 @@
 
   function openQueueEditor(existing) {
     const base = existing || {
-      id: nextId(), pid: DEFAULT_QUEUE_PID, label: '',
+      id: nextId(), pid: DEFAULT_QUEUE_PID, url: '', label: '',
       intervalMs: 30000, pollMs: 3000, watchMs: 180000,
       paymentMethod: 'motionpayalipay', useBalance: false,
       couponCode: DB.settings.defaultCoupon || '', useCoupon: true,
@@ -1648,7 +1701,10 @@
     const dlg = document.createElement('div');
     dlg.className = 'dlg';
     dlg.innerHTML = '<div class="c"><h4>' + (existing ? '编辑排队任务' : '添加排队任务') + '</h4>' +
-      '<label class="f"><span>商品 pid</span><input id="q_pid" type="number" placeholder="链接里 pid= 后面的数字，例如 32" value="' + (base.pid || '') + '"></label>' +
+      '<label class="f"><span>排队链接（推荐，改了模块名也能用）</span><input id="q_url" placeholder="https://app.vmiss.com/index.php?m=vmiss_queue&amp;pid=32" value="' + esc(base.url || '') + '">' +
+      '<div class="hint" style="margin-top:5px">直接把地址栏那一整串粘进来。填了这个就以它为准，<b style="color:#2dd4bf">官网改模块名/路径也不用改代码</b>。留空则用下面的 pid 拼默认地址。</div></label>' +
+      '<label class="f"><span>商品 pid（链接留空时用）</span><input id="q_pid" type="number" placeholder="链接里 pid= 后面的数字，例如 32" value="' + (base.pid || '') + '">' +
+      '<div class="hint" style="margin-top:5px">从上面链接里自动提取，一般不用手填。</div></label>' +
       '<label class="f"><span>备注名（留空自动从页面取）</span><input id="q_label" placeholder="例如 US.LA.TRI.Basic" value="' + esc(base.label || '') + '"></label>' +
       '<div class="g2"><label class="f"><span>巡检间隔（秒）</span><input id="q_iv" type="number" min="10" value="' + Math.round((base.intervalMs || 30000) / 1000) + '"></label>' +
       '<label class="f"><span>队列内轮询（毫秒）</span><input id="q_poll" type="number" min="1000" step="500" value="' + (base.pollMs || 3000) + '"></label></div>' +
@@ -1671,10 +1727,14 @@
     const g = (n) => dlg.querySelector('#' + n);
     g('q_cancel').onclick = () => dlg.remove();
     g('q_ok').onclick = () => {
-      const pid = Number(g('q_pid').value) || 0;
+      let url = g('q_url').value.trim();
+      let pid = Number(g('q_pid').value) || 0;
+      const mPid = url.match(/[?&]pid=(\d+)/i) || url.match(/\/(\d+)(?:[?&#]|$)/);
+      if (mPid) pid = Number(mPid[1]);
+      if (!url && !pid) { log('error', '排队链接和 pid 至少填一个'); return; }
       if (!pid) { log('error', 'pid 不能为空（链接里 pid= 后面那个数字）'); return; }
       const item = {
-        id: base.id, pid,
+        id: base.id, pid, url,
         label: g('q_label').value.trim() || base.label || '',
         intervalMs: Math.max(10000, (Number(g('q_iv').value) || 30) * 1000),
         pollMs: Math.max(1000, Number(g('q_poll').value) || 3000),
