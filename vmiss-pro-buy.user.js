@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VMISS 抢购助手
 // @namespace    vmiss-pro
-// @version      3.3.0
+// @version      3.4.0
 // @description  VMISS 库存监控与自动抢购：商品浏览、配置项、优惠码、推送，全部在插件内
 // @author       VMISS PRO
 // @license      MIT
@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const LATEST = '3.3.0';
+  const LATEST = '3.4.0';
   const VERSION_URL = '';
 
   const K = (n) => 'vmiss_v3_' + n;
@@ -69,6 +69,8 @@
     seenIntro: false, lastVersion: '',
     fetchAllGapMs: 6000,
     reqTimeoutMs: 20000,
+    cfAutoReload: true,
+    cfHeartbeat: true,
   };
   (function migrate() {
     let changed = false;
@@ -258,6 +260,8 @@
     }
     const ms = Date.now() - t0;
     const verdict = cfVerdict(res.status, text);
+    if (verdict && verdict.kind === 'challenge') cfReload(verdict.text, verdict.kind);
+    else if (!verdict && res.status < 400) cfMarkOk();
 
     if (trace) {
       const ct = String((res.headers && res.headers.get('content-type')) || '').split(';')[0].trim();
@@ -285,11 +289,90 @@
     body: new URLSearchParams(obj).toString(),
   });
 
-  function cfReload(where) {
-    if (Date.now() - cfNotified < 8000) return;
-    cfNotified = Date.now();
-    log('warn', '命中 Cloudflare 验证（' + where + '），页面 1 秒后重载');
-    setTimeout(() => location.reload(), 1000);
+  const CF_WINDOW = 10 * 60 * 1000;
+  const CF_MAX = 6;
+
+  function cfLoad() {
+    const s = load('cfStat', null);
+    if (!s || !s.at || Date.now() - s.at > CF_WINDOW) return { at: 0, n: 0, okAt: 0, warned: 0 };
+    return s;
+  }
+  function cfMarkOk() {
+    const s = load('cfStat', null);
+    if (s && s.n) { s.n = 0; s.warned = 0; s.okAt = Date.now(); save('cfStat', s); }
+  }
+
+  let cfTimer = null;
+  function cfReload(where, kind) {
+    if (DB.settings.cfAutoReload === false) return;
+    if (kind === 'waf') return;
+    if (isChallengePage()) return;
+    if (cfTimer) return;
+    const s = cfLoad();
+    if (s.n >= CF_MAX) {
+      if (!s.warned) {
+        s.warned = 1; s.at = s.at || Date.now(); save('cfStat', s);
+        log('error', 'CF 验证 10 分钟内已重载 ' + s.n + ' 次仍未通过 —— 停止自动重载');
+        log('error', '  可能被 WAF 硬封了，或者你需要手动过一次验证');
+        if (DB.settings.pushOnError) push('VMISS CF 验证失败', '10 分钟内重载 ' + s.n + ' 次仍未通过\n' + (where || '') + '\n请手动打开 app.vmiss.com 过验证');
+      }
+      return;
+    }
+    s.n += 1;
+    s.at = s.at || Date.now();
+    save('cfStat', s);
+    const delay = Math.min(20000, 2000 + s.n * 2500);
+    log('warn', '  ⚠ Cloudflare 验证（' + (where || '') + '）→ ' + (delay / 1000) + 's 后重载页面让浏览器自动过（第 ' + s.n + '/' + CF_MAX + ' 次）');
+    cfTimer = setTimeout(() => { cfTimer = null; location.reload(); }, delay);
+  }
+
+  function isChallengePage() {
+    const t = String(document.title || '');
+    const b = document.body ? String(document.body.innerText || '').slice(0, 500) : '';
+    if (/just a moment|请稍候|attention required|checking your browser|正在进行安全验证|verifying you are human|enable javascript and cookies/i.test(t + ' ' + b)) return true;
+    if (document.querySelector('#challenge-form, #cf-challenge-running, .cf-browser-verification, #cf-please-wait, #challenge-stage')) return true;
+    return false;
+  }
+
+  let cfBeat = null;
+  function startCfWatch() {
+    if (cfBeat) return;
+    cfBeat = setInterval(() => {
+      if (DB.settings.cfHeartbeat === false) return;
+      if (isChallengePage()) return;
+      if (Object.keys(running || {}).length) return;
+      if (Object.keys(queueRunning || {}).length) return;
+      if (document.visibilityState === 'hidden') return;
+      void (async () => {
+        try { await req('/clientarea.php'); } catch (e) { /* 心跳失败忽略 */ }
+      })();
+    }, 60000);
+
+    setTimeout(() => {
+      if (DB.settings.cfHeartbeat === false) return;
+      if (isChallengePage()) return;
+      void (async () => { try { await req('/clientarea.php'); } catch (e) { /* ignore */ } })();
+    }, 20000);
+  }
+
+  function waitChallengePass() {
+    const t0 = Date.now();
+    log('warn', '页面当前在 Cloudflare 验证页 —— 等浏览器自动完成，期间不发任何请求');
+    const iv = setInterval(() => {
+      if (!isChallengePage()) {
+        clearInterval(iv);
+        const sec = Math.round((Date.now() - t0) / 1000);
+        log('info', '✅ CF 验证已通过（等了 ' + sec + ' 秒）');
+        cfMarkOk();
+        return;
+      }
+      const sec = Math.round((Date.now() - t0) / 1000);
+      if (sec > 45) {
+        clearInterval(iv);
+        log('error', '✗ CF 验证 45 秒仍未通过 —— 需要你手动点一下');
+        if (DB.settings.pushOnError) push('VMISS CF 验证卡住', '自动等待 45 秒仍未通过\n请手动打开 app.vmiss.com 过验证');
+      }
+    }, 2000);
   }
 
   let csrfCache = { v: '', at: 0 };
@@ -1094,6 +1177,10 @@
       '<label class="f"><span>抢购爆发间隔（毫秒，越小越快越易限速）</span><input id="s5" type="number" min="0" max="2000" step="50" value="' + s.burstGapMs + '"></label>' +
       '<label class="f"><span>单请求超时（毫秒）</span><input id="s8" type="number" min="3000" step="1000" value="' + (s.reqTimeoutMs || 20000) + '">' +
       '<div class="hint" style="margin-top:5px">超过这个时间没响应就中断并报错。没有超时的话，连接一挂住任务会静默卡死（卡片还显示 [跑]）。默认 20000。</div></label>' +
+      '<label class="f"><span>CF 验证自动重载</span><select id="s9"><option value="1"' + (s.cfAutoReload === false ? '' : ' selected') + '>开（推荐）</option><option value="0"' + (s.cfAutoReload === false ? ' selected' : '') + '>关</option></select>' +
+      '<div class="hint" style="margin-top:5px">命中 Cloudflare 挑战时自动刷新页面，让浏览器自己去过验证（只有页面导航才会触发 CF 自动验证，fetch 不会）。10 分钟内最多重载 6 次，超了就推送告警。</div></label>' +
+      '<label class="f"><span>CF 空闲心跳</span><select id="s10"><option value="1"' + (s.cfHeartbeat === false ? '' : ' selected') + '>开（推荐）</option><option value="0"' + (s.cfHeartbeat === false ? ' selected' : '') + '>关</option></select>' +
+      '<div class="hint" style="margin-top:5px">空闲时每分钟请求一次 clientarea.php，提前发现 cf_clearance 过期。有监控/排队在跑或标签页在后台时不发。</div></label>' +
       '<label class="f"><span>默认优惠码</span><input id="s7" placeholder="10%OFF" value="' + esc(s.defaultCoupon) + '">' +
       '<div class="hint" style="margin-top:5px">默认使用优惠码 <b style="color:#fbbf24">10%OFF</b>（全场通用）。新加的监控会自动填上，留空即不使用。</div></label>' +
       '<label class="f"><span>同时处理几笔下单</span><input id="s3" type="number" min="1" max="5" value="' + s.maxConcurrent + '"></label>' +
@@ -1238,6 +1325,8 @@
         DB.settings.minGapMs = Math.max(1500, Number(g('s2').value) * 1000 || 1700);
         DB.settings.burstGapMs = Math.min(2000, Math.max(0, Number(g('s5').value)));
         DB.settings.reqTimeoutMs = Math.max(3000, Number(g('s8').value) || 20000);
+        DB.settings.cfAutoReload = g('s9').value === '1';
+        DB.settings.cfHeartbeat = g('s10').value === '1';
         DB.settings.defaultCoupon = g('s7').value.trim();
         DB.settings.maxConcurrent = Math.min(5, Math.max(1, Number(g('s3').value) || 1));
         DB.settings.prewarmCsrf = g('s6').value === '1';
@@ -2228,12 +2317,15 @@
   }
 
   function boot() {
+
+    if (isChallengePage()) { waitChallengePass(); return; }
     root = shell();
     UI.ready = true;
     UI.render();
     UI.renderStatus();
     schedule();
     startPrewarm();
+    startCfWatch();
     setInterval(() => {
       UI.renderStatus();
       if (UI.tab === 'monitors') UI.renderMonitors();
